@@ -1,0 +1,120 @@
+---
+title: Introduction
+description: A modern C++20 policy-based framework for crafting undetectable syscalls on Windows
+---
+
+## What is syscalls-cpp?
+
+syscalls-cpp is a C++20 policy-based framework for crafting undetectable/protected syscalls on Windows (x86/x64). It provides a modular, compile-time approach to system call invocation that gives you full control over operational security tradeoffs.
+
+The core principle is **modularity**. You are not given a black box; you are given building blocks.
+
+## Why syscalls-cpp?
+
+Traditional syscall libraries often provide limited flexibility and can be easily detected by security software. syscalls-cpp addresses these challenges by:
+
+- **Policy-based Design**: Mix and match allocation, stub generation, and parsing strategies at compile-time
+- **Automatic Resolution**: Directly parses ntdll.dll metadata to resolve system call numbers
+- **Hook Resilience**: Leverages PE structure (exception directory on x64, sorted exports on x86) to bypass user-mode hooks
+- **Adjacent Syscall Detection**: Can find nearby syscalls if a target is patched
+- **Type Safety**: Leverages C++20 concepts for compile-time validation
+
+<Frame>
+  <img src="https://raw.githubusercontent.com/sapdragon/syscalls-cpp/refs/heads/main/docs/images/protection_demo.gif" alt="SEC_NO_CHANGE protection demonstration" />
+</Frame>
+
+*An attempt to patch a syscall in a `SEC_NO_CHANGE` protected section fails.*
+
+## Architecture Overview
+
+The framework is built around three core policy types:
+
+### Allocation Policies
+
+Control how memory for syscall stubs is allocated:
+
+| Policy | Method | Security Level |
+| ------ | ------ | -------------- |
+| `allocator::section` | `NtCreateSection` with `SEC_NO_CHANGE` flag | Highest - prevents patching |
+| `allocator::heap` | `HeapCreate` with `HEAP_CREATE_ENABLE_EXECUTE` | Medium |
+| `allocator::memory` | `NtAllocateVirtualMemory` (`RW` → `RX`) | Standard |
+
+### Stub Generation Policies
+
+Define how syscall instructions are generated:
+
+| Policy | Method | Platform |
+| ------ | ------ | -------- |
+| `generator::direct` | Classic self-contained `syscall` instruction | x86/x64 |
+| `generator::gadget` | Jumps to `syscall; ret` gadget in ntdll.dll | x64 only |
+| `generator::exception` | Triggers breakpoint (`ud2`) via custom VEH | x86/x64 |
+
+### Parsing Policies
+
+Determine how syscall numbers are resolved:
+
+| Policy | Method | Notes |
+| ------ | ------ | ----- |
+| `parser::directory` | Maps exception directory (.pdata) to exports (x64) or sorts Zw* exports (x86) | Primary method |
+| `parser::signature` | Scans function prologues with hook detection | Fallback with halo gates |
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Compile-time Policy Selection" icon="code">
+    Choose allocation, generation, and parsing strategies at compile-time for zero runtime overhead
+  </Card>
+  <Card title="Extensible Design" icon="puzzle-piece">
+    Create custom policies by implementing simple C++20 concepts
+  </Card>
+  <Card title="Hook Detection" icon="shield-check">
+    Automatically detects and bypasses common hooking techniques
+  </Card>
+  <Card title="Thread-safe" icon="lock">
+    Built-in synchronization for safe concurrent usage
+  </Card>
+</CardGroup>
+
+## Example Usage
+
+Here's a simple example of allocating memory using direct syscalls with section-based protection:
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+int main() {
+    syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::direct
+    > syscallManager;
+    
+    if (!syscallManager.initialize()) {
+        return 1;
+    }
+    
+    PVOID pBaseAddress = nullptr;
+    SIZE_T uSize = 0x1000;
+    
+    syscallManager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        syscall::native::getCurrentProcess(),
+        &pBaseAddress,
+        0, &uSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+    
+    return 0;
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install syscalls-cpp using vcpkg or Conan
+  </Card>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get started with a step-by-step guide
+  </Card>
+</CardGroup>

@@ -1,0 +1,180 @@
+---
+title: "Policy-Based Architecture Overview"
+description: "Understanding the modular policy-based design of syscalls-cpp and how policies work together to create flexible syscall strategies"
+---
+
+## Introduction
+
+The syscalls-cpp library is built on a **policy-based architecture** that leverages C++20 concepts to provide compile-time verified, modular building blocks for syscall execution. Rather than providing a single monolithic implementation, the library allows you to compose different strategies (policies) for memory allocation, stub generation, and syscall number resolution.
+
+The core principle is **modularity**. You are not given a black box; you are given building blocks.
+
+## The Three Policy Types
+
+The library defines three distinct policy categories, each enforced through C++20 concepts:
+
+### 1. Allocation Policies (`IsIAllocationPolicy`)
+
+Control **where and how** syscall stubs are stored in memory:
+
+- `allocator::section` - Uses `SEC_NO_CHANGE` sections for immutable stubs
+- `allocator::heap` - Uses executable heaps with `HEAP_CREATE_ENABLE_EXECUTE`
+- `allocator::memory` - Standard virtual memory with RW → RX transition
+
+### 2. Stub Generation Policies (`IsStubGenerationPolicy`)
+
+Control **how syscalls are executed**:
+
+- `generator::direct` - Classic self-contained `syscall` instruction
+- `generator::gadget` - Indirect execution via `syscall; ret` gadgets from ntdll (x64 only)
+- `generator::exception` - VEH-based approach using `ud2` breakpoints
+
+### 3. Parsing Policies (`IsSyscallParsingPolicy`)
+
+Control **how syscall numbers are resolved**:
+
+- `parser::directory` - Uses exception directory (x64) or sorted exports (x86)
+- `parser::signature` - Scans function prologues with hook detection and halo gates
+
+## C++20 Concepts
+
+The library uses C++20 concepts to enforce policy contracts at compile-time. This ensures type safety and provides clear error messages if a policy doesn't meet requirements.
+
+### IsIAllocationPolicy Concept
+
+```cpp
+template<typename T>
+concept IsIAllocationPolicy = requires(size_t uSize, const std::span<const uint8_t>vecBuffer, void*& pRegion, HANDLE & hObject)
+{
+    { T::allocate(uSize, vecBuffer, pRegion, hObject) } -> std::convertible_to<bool>;
+    { T::release(pRegion, hObject) } -> std::same_as<void>;
+};
+```
+
+Any allocation policy must provide:
+- `static bool allocate(...)` - Allocate and populate memory
+- `static void release(...)` - Clean up allocated resources
+
+### IsStubGenerationPolicy Concept
+
+```cpp
+template<typename T>
+concept IsStubGenerationPolicy = requires(uint8_t * pBuffer, uint32_t uSyscallNumber, void* pGadget)
+{
+    { T::bRequiresGadget } -> std::same_as<const bool&>;
+    { T::getStubSize() } -> std::convertible_to<size_t>;
+    { T::generate(pBuffer, uSyscallNumber, pGadget) } -> std::same_as<void>;
+};
+```
+
+Any stub generation policy must provide:
+- `static constexpr bool bRequiresGadget` - Whether the policy needs syscall gadgets
+- `static constexpr size_t getStubSize()` - Size of generated stub in bytes
+- `static void generate(...)` - Generate the stub code
+
+### IsSyscallParsingPolicy Concept
+
+```cpp
+template<typename T>
+concept IsSyscallParsingPolicy = requires(const ModuleInfo_t & module)
+{
+    { T::parse(module) } -> std::convertible_to<std::vector<SyscallEntry_t>>;
+};
+```
+
+Any parsing policy must provide:
+- `static std::vector<SyscallEntry_t> parse(...)` - Extract syscall numbers from a module
+
+## The Manager Template
+
+The `Manager` class template is the central component that ties policies together:
+
+```cpp
+template<
+    typename IAllocationPolicy,
+    typename IStubGenerationPolicy,
+    typename IFirstParser,
+    typename ... IFallbackParsers
+>
+class ManagerImpl { /* ... */ };
+```
+
+The Manager:
+1. **Validates policies** at compile-time using static assertions
+2. **Initializes the syscall infrastructure** by parsing modules and generating stubs
+3. **Provides the `invoke()` method** for executing syscalls with type safety
+4. **Manages resource lifecycle** through RAII principles
+
+## Policy Composition Flow
+
+When you create a Manager instance, the following happens:
+
+1. **Parsing Phase**: Parsers extract syscall numbers from ntdll.dll (or other modules)
+2. **Randomization**: Syscall entries are shuffled for OPSEC
+3. **Stub Generation**: Each syscall gets a stub generated based on the generation policy
+4. **Allocation**: All stubs are written to memory using the allocation policy
+5. **Ready**: The `invoke()` method can now be called to execute syscalls
+
+<CodeGroup>
+```cpp Standard Usage
+SyscallSectionDirect manager;
+if (!manager.initialize()) {
+    // Handle initialization failure
+}
+
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pBaseAddress,
+    0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+```cpp Custom Composition
+using CustomManager = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::direct,
+    syscall::DefaultParserChain
+>;
+
+CustomManager manager;
+manager.initialize();
+```
+</CodeGroup>
+
+## Static Assertions for Policy Validation
+
+The library provides helpful compile-time error messages when policies don't meet requirements:
+
+```cpp
+static_assert(IsIAllocationPolicy<IAllocationPolicy>,
+    "[Syscall] The provided allocation policy is not valid. "
+    "A valid allocation policy must provide two static functions: "
+    "1. 'static bool allocate(size_t, const std::span<const uint8_t>, void*&, HANDLE&);' "
+    "2. 'static void release(void*, HANDLE);'"
+);
+```
+
+These static assertions ensure that:
+- All template parameters satisfy their respective concepts
+- Compilation fails early with clear error messages
+- No runtime surprises due to missing or incorrect policy implementations
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Allocation Policies" icon="memory" href="/core-concepts/allocation-policies">
+    Learn about the three allocation strategies and their security implications
+  </Card>
+  <Card title="Stub Generation Policies" icon="microchip" href="/core-concepts/stub-generation-policies">
+    Understand how syscall stubs are generated and executed
+  </Card>
+  <Card title="Parsing Policies" icon="magnifying-glass" href="/core-concepts/parsing-policies">
+    Explore syscall number resolution and hook detection
+  </Card>
+  <Card title="Policy Composition" icon="puzzle-piece" href="/core-concepts/policy-composition">
+    Master the art of composing policies for your use case
+  </Card>
+</CardGroup>

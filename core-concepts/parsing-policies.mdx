@@ -1,0 +1,605 @@
+---
+title: "Parsing Policies"
+description: "Learn how syscall numbers are resolved from ntdll.dll using directory-based parsing and signature scanning with halo gates hook detection"
+---
+
+## Overview
+
+Parsing policies are responsible for **discovering syscall numbers** by analyzing ntdll.dll (or other system modules). Since syscall numbers can vary between Windows versions, the library must dynamically resolve them at runtime.
+
+All parsing policies must satisfy the `IsSyscallParsingPolicy` concept:
+
+```cpp
+template<typename T>
+concept IsSyscallParsingPolicy = requires(const ModuleInfo_t & module)
+{
+    { T::parse(module) } -> std::convertible_to<std::vector<SyscallEntry_t>>;
+};
+```
+
+Each parser returns a vector of `SyscallEntry_t` structures containing:
+- `m_key` - Hash or name of the syscall (e.g., `NtAllocateVirtualMemory`)
+- `m_uSyscallNumber` - The resolved syscall number
+- `m_uOffset` - Offset into the stub region (set later by Manager)
+
+## parser::directory
+
+### Overview
+
+The `directory` parser uses **PE metadata** to determine syscall order:
+- **x64**: Maps the exception directory (`.pdata`) to export table entries
+- **x86**: Sorts exported `Zw*` functions by their memory addresses
+
+This approach is **clean and reliable** because it relies on Windows internal ordering guarantees rather than reading function bytes.
+
+<Info>
+**Key Insight**: The order of functions in the exception directory (x64) or sorted export addresses (x86) directly corresponds to their syscall numbers.
+</Info>
+
+### Implementation Details
+
+Location: `syscall.hpp:345-453`
+
+```cpp
+struct directory
+{
+    static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+    {
+        std::vector<SyscallEntry_t> vecFoundSyscalls;
+        
+        // x64: Use exception directory
+        if constexpr (platform::isWindows64)
+        {
+            auto uExceptionDirRva = module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+            if (!uExceptionDirRva)
+                return vecFoundSyscalls;
+
+            auto pRuntimeFunctions = reinterpret_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(module.m_pModuleBase + uExceptionDirRva);
+            auto uExceptionDirSize = module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+            auto uFunctionCount = uExceptionDirSize / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+
+            // Map RVA to export names
+            auto pFunctionsRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+            auto pNamesRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+            auto pOrdinalsRva = reinterpret_cast<uint16_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+            std::unordered_map<uint32_t, const char*> mapRvaToName;
+            for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; ++i)
+            {
+                const char* szName = reinterpret_cast<const char*>(module.m_pModuleBase + pNamesRVA[i]);
+                uint16_t uOrdinal = pOrdinalsRva[i];
+                uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+                mapRvaToName[uFunctionRva] = szName;
+            }
+
+            // Iterate through runtime functions in order
+            uint32_t uSyscallNumber = 0;
+            for (DWORD i = 0; i < uFunctionCount; ++i)
+            {
+                auto pFunction = &pRuntimeFunctions[i];
+                if (pFunction->BeginAddress == 0)
+                    break;
+
+                auto it = mapRvaToName.find(pFunction->BeginAddress);
+                if (it != mapRvaToName.end())
+                {
+                    const char* szName = it->second;
+
+                    // Check if it starts with "Zw"
+                    if (hashing::calculateHashRuntime(szName, 2) == hashing::calculateHash("Zw"))
+                    {
+                        // Convert Zw* to Nt*
+                        char szNtName[128];
+                        std::copy_n(szName, sizeof(szNtName)-1, szNtName);
+                        szNtName[0] = 'N';
+                        szNtName[1] = 't';
+
+                        const SyscallKey_t key = SYSCALL_ID_RT(szNtName);
+                        vecFoundSyscalls.push_back(SyscallEntry_t{ key, uSyscallNumber, 0 });
+                        uSyscallNumber++;
+                    }
+                }
+            }
+        }
+        // x86: Sort Zw exports by address
+        else
+        {
+            auto pFunctionsRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+            auto pNamesRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+            auto pOrdinalsRva = reinterpret_cast<uint16_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+            std::vector<std::pair<uintptr_t, const char*>> vecZwFunctions;
+            for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; ++i)
+            {
+                const char* szName = reinterpret_cast<const char*>(module.m_pModuleBase + pNamesRVA[i]);
+
+                // Check for Zw* exports
+                if (szName[0] == 'Z' && szName[1] == 'w')
+                {
+                    uint16_t uOrdinal = pOrdinalsRva[i];
+                    uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+
+                    // Skip forwarded exports
+                    auto pExportSectionStart = module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                    auto pExportSectionEnd = pExportSectionStart + module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+                    if (uFunctionRva >= pExportSectionStart && uFunctionRva < pExportSectionEnd)
+                        continue;
+
+                    uintptr_t uFunctionAddress = reinterpret_cast<uintptr_t>(module.m_pModuleBase + uFunctionRva);
+                    vecZwFunctions.push_back({ uFunctionAddress, szName });
+                }
+            }
+
+            if (vecZwFunctions.empty())
+                return vecFoundSyscalls;
+
+            // Sort by address
+            std::sort(vecZwFunctions.begin(), vecZwFunctions.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+
+            // Assign syscall numbers in sorted order
+            uint32_t uSyscallNumber = 0;
+            for (const auto& [_, szName] : vecZwFunctions) 
+            {
+                char szNtName[128];
+                std::copy_n(szName, sizeof(szNtName)-1, szNtName);
+                szNtName[0] = 'N';
+                szNtName[1] = 't';
+
+                const SyscallKey_t key = SYSCALL_ID_RT(szNtName);
+                vecFoundSyscalls.push_back(SyscallEntry_t{ key, uSyscallNumber, 0 });
+                uSyscallNumber++;
+            }
+        }
+
+        return vecFoundSyscalls;
+    }
+};
+```
+
+### x64 Approach: Exception Directory
+
+On x64 Windows, the `.pdata` section (exception directory) contains `IMAGE_RUNTIME_FUNCTION_ENTRY` structures in **sorted order by RVA**. This order matches syscall number assignment.
+
+<Steps>
+  <Step title="Read Exception Directory">
+    Parse `DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]` to get runtime function entries
+  </Step>
+  
+  <Step title="Map RVA to Export Names">
+    Build a mapping from function RVA to export name using the export directory
+  </Step>
+  
+  <Step title="Iterate in Order">
+    Walk through runtime functions sequentially. For each `Zw*` function, assign an incrementing syscall number
+  </Step>
+  
+  <Step title="Convert Zw to Nt">
+    Replace "Zw" prefix with "Nt" for consistency (both are valid, but library uses Nt*)
+  </Step>
+</Steps>
+
+### x86 Approach: Sorted Exports
+
+On x86 Windows, syscall numbers correspond to the **sorted address order** of `Zw*` exports.
+
+<Steps>
+  <Step title="Collect Zw Exports">
+    Enumerate all exported functions starting with "Zw"
+  </Step>
+  
+  <Step title="Resolve Addresses">
+    Get the memory address for each export (skip forwarded exports)
+  </Step>
+  
+  <Step title="Sort by Address">
+    Sort all Zw functions by their virtual address
+  </Step>
+  
+  <Step title="Assign Syscall Numbers">
+    The sorted order determines syscall numbers (0, 1, 2, ...)
+  </Step>
+</Steps>
+
+### Security Characteristics
+
+**Advantages**:
+- Does not read function bytes (no false positives from hooks)
+- Relies on PE structure (stable and reliable)
+- Works even if all functions are hooked
+- No pattern matching required
+- Fast execution
+
+**Limitations**:
+- Assumes Windows ordering guarantees hold (they do in practice)
+- Cannot detect if the export table itself is tampered with
+- Requires valid PE structure
+
+<Tip>**Best for**: Clean, reliable syscall resolution without reading function code</Tip>
+
+## parser::signature
+
+### Overview
+
+The `signature` parser scans function **prologue bytes** for the syscall number directly embedded in the machine code. It also includes **hook detection** and implements the **halo gates technique** to find syscall numbers even when functions are hooked.
+
+<Info>
+**Halo Gates**: If a function is hooked, search adjacent functions ("neighbors") to find their syscall numbers, then calculate the target's number by offset.
+</Info>
+
+### Implementation Details
+
+Location: `syscall.hpp:455-599`
+
+```cpp
+struct signature
+{
+    static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+    {
+        std::vector<SyscallEntry_t> vecFoundSyscalls;
+
+        auto pFunctionsRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+        auto pNamesRVA = reinterpret_cast<uint32_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+        auto pOrdinalsRva = reinterpret_cast<uint16_t*>(module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+        for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; i++)
+        {
+            const char* szName = reinterpret_cast<const char*>(module.m_pModuleBase + pNamesRVA[i]);
+
+            // Only process Nt* exports
+            if (hashing::calculateHashRuntime(szName, 2) != hashing::calculateHash("Nt"))
+                continue;
+
+            uint16_t uOrdinal = pOrdinalsRva[i];
+            uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+
+            // Skip forwarded exports
+            auto pExportSectionStart = module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            auto pExportSectionEnd = pExportSectionStart + module.m_pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+            if (uFunctionRva >= pExportSectionStart && uFunctionRva < pExportSectionEnd)
+                continue;
+
+            uint8_t* pFunctionStart = module.m_pModuleBase + uFunctionRva;
+            uint32_t uSyscallNumber = 0;
+            bool bSyscallFound = false;
+
+            // x64: Check for "mov r10, rcx; mov eax, syscall_number"
+            if constexpr (platform::isWindows64)
+            {
+                if (*reinterpret_cast<uint32_t*>(pFunctionStart) == 0xB8D18B4C)
+                {
+                    uSyscallNumber = *reinterpret_cast<uint32_t*>(pFunctionStart + 4);
+                    bSyscallFound = true;
+                }
+            }
+
+            // x86: Check for "mov eax, syscall_number"
+            if constexpr (platform::isWindows32)
+            {
+                if (*pFunctionStart == 0xB8)
+                {
+                    uSyscallNumber = *reinterpret_cast<uint32_t*>(pFunctionStart + 1);
+                    bSyscallFound = true;
+                }
+            }
+            
+            // Hook detection and halo gates (x64 only)
+            if constexpr (platform::isWindows64)
+            {
+                if (isFunctionHooked(pFunctionStart) && !bSyscallFound)
+                {
+                    // Search up: check functions at -0x20, -0x40, ...
+                    for (int j = 1; j < 20; ++j)
+                    {
+                        uint8_t* pNeighborFunc = pFunctionStart - (j * 0x20);
+                        if (reinterpret_cast<uintptr_t>(pNeighborFunc) < reinterpret_cast<uintptr_t>(module.m_pModuleBase)) 
+                            break;
+                        
+                        if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+                        {
+                            uint32_t uNeighborSyscall = *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+                            uSyscallNumber = uNeighborSyscall + j;
+                            bSyscallFound = true;
+                            break;
+                        }
+                    }
+
+                    // Search down: check functions at +0x20, +0x40, ...
+                    if (!bSyscallFound)
+                    {
+                        for (int j = 1; j < 20; ++j)
+                        {
+                            uint8_t* pNeighborFunc = pFunctionStart + (j * 0x20);
+                            if (reinterpret_cast<uintptr_t>(pNeighborFunc) > (reinterpret_cast<uintptr_t>(module.m_pModuleBase) + module.m_pNtHeaders->OptionalHeader.SizeOfImage)) 
+                                break;
+                            
+                            if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+                            {
+                                uint32_t uNeighborSyscall = *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+                                uSyscallNumber = uNeighborSyscall - j;
+                                bSyscallFound = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (bSyscallFound)
+            {
+                const SyscallKey_t key = SYSCALL_ID_RT(szName);
+                vecFoundSyscalls.push_back(SyscallEntry_t{ key, uSyscallNumber, 0 });
+            }
+        }
+        return vecFoundSyscalls;
+    }
+    
+private:
+    static bool isFunctionHooked(const uint8_t* pFunctionStart)
+    {
+        const uint8_t* pCurrent = pFunctionStart;
+
+        // Skip leading NOPs
+        while (*pCurrent == 0x90)
+            pCurrent++;
+
+        switch (pCurrent[0])
+        {
+            // JMP rel32
+            case 0xE9:
+            // JMP rel8
+            case 0xEB:
+            // push imm32
+            case 0x68:
+                return true;
+
+            // jmp [mem] / jmp [rip + offset]
+            case 0xFF:
+                if (pCurrent[1] == 0x25)
+                    return true;
+                break;
+
+            // int3
+            case 0xCC:
+                return true;
+
+            // ud2
+            case 0x0F:
+                if (pCurrent[1] == 0x0B)
+                    return true;
+                break;
+
+            // int 0x3
+            case 0xCD:
+                if (pCurrent[1] == 0x03)
+                    return true;
+                break;
+
+            default:
+                break;
+        }
+
+        return false;
+    }
+};
+```
+
+### Signature Patterns
+
+#### x64 Pattern
+
+```asm
+mov r10, rcx        ; 0x4C 0x8B 0xD1
+mov eax, 0x00000000 ; 0xB8 [syscall number as 4 bytes]
+```
+
+Combined signature: `0xB8D18B4C` (little-endian)
+
+The syscall number is at offset +4 from the function start.
+
+#### x86 Pattern
+
+```asm
+mov eax, 0x00000000 ; 0xB8 [syscall number as 4 bytes]
+```
+
+The syscall number is at offset +1 from the function start.
+
+### Hook Detection
+
+The `isFunctionHooked()` function checks for common hooking patterns:
+
+| Pattern | Bytes | Description |
+|---------|-------|-------------|
+| **JMP rel32** | `0xE9` | Relative jump (5 bytes) |
+| **JMP rel8** | `0xEB` | Short jump (2 bytes) |
+| **JMP [mem]** | `0xFF 0x25` | Indirect jump via memory |
+| **PUSH + RET** | `0x68` | Push address + return trampoline |
+| **INT3** | `0xCC` | Debugger breakpoint |
+| **UD2** | `0x0F 0x0B` | Illegal instruction |
+| **INT 0x3** | `0xCD 0x03` | Interrupt-based breakpoint |
+
+If any of these patterns are found at the function start, it's considered hooked.
+
+### Halo Gates Technique
+
+When a function is hooked, the parser implements **halo gates**:
+
+<Steps>
+  <Step title="Detect Hook">
+    If `isFunctionHooked()` returns true and no syscall number was found
+  </Step>
+  
+  <Step title="Search Up">
+    Check functions at offsets -0x20, -0x40, -0x60, ... (up to 20 steps)
+    
+    Functions are typically aligned on 0x20-byte boundaries in ntdll
+  </Step>
+  
+  <Step title="Found Neighbor?">
+    If a neighbor has a valid signature, calculate: `target_syscall = neighbor_syscall + offset`
+  </Step>
+  
+  <Step title="Search Down">
+    If not found above, search at +0x20, +0x40, +0x60, ...
+    
+    Calculate: `target_syscall = neighbor_syscall - offset`
+  </Step>
+</Steps>
+
+**Example:**
+
+```
+NtAllocateVirtualMemory @ 0x1000  [HOOKED - signature not found]
+NtClose @ 0x1020                  [syscall number = 15]
+NtCreateFile @ 0x1040             [syscall number = 16]
+```
+
+Halo gates finds `NtClose` at offset +1 (0x20 bytes away):
+
+```
+NtAllocateVirtualMemory syscall = 15 - 1 = 14
+```
+
+### Security Characteristics
+
+**Advantages**:
+- Direct syscall number extraction from code
+- Hook detection built-in
+- Halo gates bypass for hooked functions
+- Works when directory parsing is unreliable
+- Can identify tampered functions
+
+**Limitations**:
+- Reads function bytes (may trigger memory scanners)
+- Halo gates assume 0x20-byte alignment (usually true, but not guaranteed)
+- x86 halo gates are not implemented (less reliable)
+- Signature patterns may change in future Windows versions
+
+<Tip>**Best for**: Environments with userland hooks where direct syscall number extraction is needed</Tip>
+
+## Parser Fallback Chain
+
+The library supports **parser chaining** where multiple parsers are tried in sequence:
+
+Location: `syscall.hpp:822-834`
+
+```cpp
+template<IsSyscallParsingPolicy CurrentParser, IsSyscallParsingPolicy... OtherParsers>
+std::vector<SyscallEntry_t> tryParseSyscalls(const ModuleInfo_t& moduleInfo)
+{
+    auto vecSyscalls = CurrentParser::parse(moduleInfo);
+
+    if (!vecSyscalls.empty())
+        return vecSyscalls;
+
+    if constexpr (sizeof...(OtherParsers) > 0)
+        return tryParseSyscalls<OtherParsers...>(moduleInfo);
+
+    return vecSyscalls;
+}
+```
+
+The default parser chain:
+
+```cpp
+using DefaultParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,   // Try directory first (clean)
+    syscall::policies::parser::signature    // Fall back to signature scanning
+>;
+```
+
+<Info>
+**Fallback Strategy**: Try `directory` first for clean PE-based parsing. If it fails or returns empty results, fall back to `signature` scanning with hook detection.
+</Info>
+
+## Comparison Matrix
+
+| Feature | `directory` | `signature` |
+|---------|-------------|-------------|
+| **Reads Function Bytes** | ❌ No | ✅ Yes |
+| **Hook Detection** | ❌ No | ✅ Yes |
+| **Halo Gates** | ❌ No | ✅ Yes (x64) |
+| **Relies on PE Structure** | ✅ Yes | Partial |
+| **Works with Hooks** | ✅ Yes | ✅ Yes |
+| **Platform Support** | x86 + x64 | x86 + x64 |
+| **Complexity** | Medium | High |
+| **Reliability** | Very High | High |
+| **Speed** | Fast | Slower |
+
+## Choosing the Right Policy
+
+<Steps>
+  <Step title="Clean Environment">
+    Use `parser::directory` for fast, reliable parsing based on PE structure alone
+  </Step>
+  
+  <Step title="Hooked Environment">
+    Use `parser::signature` to detect hooks and use halo gates to find syscall numbers despite tampering
+  </Step>
+  
+  <Step title="Best of Both">
+    Use `DefaultParserChain` (directory → signature) to try clean parsing first, then fall back to signature scanning
+  </Step>
+</Steps>
+
+## Usage Examples
+
+<CodeGroup>
+```cpp Directory Parser Only
+using CleanManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct,
+    syscall::policies::parser::directory    // PE structure only
+>;
+
+CleanManager manager;
+manager.initialize();
+```
+
+```cpp Signature Parser Only
+using RobustManager = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::gadget,
+    syscall::policies::parser::signature    // Signature + halo gates
+>;
+
+RobustManager manager;
+manager.initialize();
+```
+
+```cpp Default Parser Chain
+using BalancedManager = syscall::Manager<
+    syscall::policies::allocator::memory,
+    syscall::policies::generator::direct,
+    syscall::DefaultParserChain             // directory → signature fallback
+>;
+
+BalancedManager manager;
+manager.initialize();
+```
+
+```cpp Custom Parser Chain
+using MyChain = syscall::ParserChain_t<
+    syscall::policies::parser::signature,   // Try signature first
+    syscall::policies::parser::directory    // Fall back to directory
+>;
+
+using CustomManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::exception,
+    MyChain
+>;
+
+CustomManager manager;
+manager.initialize();
+```
+</CodeGroup>
+
+## Next Steps
+
+<Card title="Policy Composition" icon="puzzle-piece" href="/core-concepts/policy-composition">
+  Learn how to compose policies and create custom combinations
+</Card>

@@ -1,0 +1,180 @@
+---
+title: "syscall::Manager"
+description: "Template class for managing syscall stubs with customizable allocation, stub generation, and parsing policies"
+---
+
+## Overview
+
+The `syscall::Manager` template class is the primary interface for managing syscall stubs in the syscalls-cpp library. It coordinates syscall parsing, stub generation, and memory allocation through customizable policy-based template parameters.
+
+## Template Declaration
+
+```cpp
+template<
+    typename AllocPolicy,
+    typename StubPolicy,
+    typename... ParserArgs
+>
+class Manager;
+```
+
+### Template Parameters
+
+<ParamField path="AllocPolicy" type="typename" required>
+  Memory allocation policy that determines how syscall stubs are allocated. Must satisfy `IsIAllocationPolicy` concept.
+  
+  **Requirements:**
+  - `static bool allocate(size_t, const std::span<const uint8_t>, void*&, HANDLE&);`
+  - `static void release(void*, HANDLE);`
+  
+  **Built-in policies:**
+  - `syscall::policies::allocator::section` - Section-based allocation
+  - `syscall::policies::allocator::heap` - Heap-based allocation
+</ParamField>
+
+<ParamField path="StubPolicy" type="typename" required>
+  Stub generation policy that determines how syscall stubs are created. Must satisfy `IsStubGenerationPolicy` concept.
+  
+  **Requirements:**
+  - `static constexpr bool bRequiresGadget;`
+  - `static constexpr size_t getStubSize();`
+  - `static void generate(uint8_t*, uint32_t, void*);`
+  
+  **Built-in policies:**
+  - `syscall::policies::generator::direct` - Direct syscall execution
+  - `syscall::policies::generator::gadget` - Gadget-based syscall execution
+  - `syscall::policies::generator::exception` - Exception-based syscall execution
+</ParamField>
+
+<ParamField path="ParserArgs" type="typename...">
+  Parser chain or individual parser policies for extracting syscall numbers from modules. Defaults to `DefaultParserChain` if not specified.
+  
+  **Built-in parsers:**
+  - `syscall::policies::parser::directory` - Export directory parsing
+  - `syscall::policies::parser::signature` - Signature-based parsing
+  
+  **Parser chain:**
+  - `syscall::ParserChain_t<Parser1, Parser2, ...>` - Chain multiple parsers with fallback
+</ParamField>
+
+## Type Aliases
+
+The library provides convenient type aliases for common Manager configurations:
+
+### SyscallSectionDirect
+
+```cpp
+using SyscallSectionDirect = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct
+>;
+```
+
+Uses section-based allocation with direct syscall execution. Available on all platforms.
+
+### SyscallSectionGadget
+
+```cpp
+using SyscallSectionGadget = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::gadget
+>;
+```
+
+Uses section-based allocation with gadget-based syscall execution. **Windows x64 only.**
+
+### SyscallHeapGadget
+
+```cpp
+using SyscallHeapGadget = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::gadget
+>;
+```
+
+Uses heap-based allocation with gadget-based syscall execution. **Windows x64 only.**
+
+## Member Functions
+
+<CardGroup cols={2}>
+  <Card title="initialize()" icon="play" href="/api/manager-initialization">
+    Initialize the manager and parse syscalls from specified modules
+  </Card>
+  <Card title="invoke()" icon="bolt" href="/api/manager-invocation">
+    Invoke a syscall by name with type-safe arguments
+  </Card>
+</CardGroup>
+
+## Constructor and Destructor
+
+### Default Constructor
+
+```cpp
+ManagerImpl() = default;
+```
+
+Creates an uninitialized manager. Call `initialize()` before invoking syscalls.
+
+### Destructor
+
+```cpp
+~ManagerImpl();
+```
+
+Automatically cleans up allocated resources:
+- Removes vectored exception handler (if using exception policy)
+- Releases allocated syscall memory region
+- Releases associated object handles
+
+## Move Semantics
+
+The Manager supports move construction and move assignment:
+
+```cpp
+ManagerImpl(ManagerImpl&& other) noexcept;
+ManagerImpl& operator=(ManagerImpl&& other) noexcept;
+```
+
+Copy operations are explicitly deleted:
+
+```cpp
+ManagerImpl(const ManagerImpl&) = delete;
+ManagerImpl& operator=(const ManagerImpl&) = delete;
+```
+
+## Thread Safety
+
+The Manager uses internal mutex locking to ensure thread-safe initialization. Multiple threads can safely call `initialize()` concurrently, and only one initialization will occur. Once initialized, `invoke()` can be called from multiple threads without additional synchronization.
+
+## Example Usage
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+int main()
+{
+    // Create a manager instance
+    SyscallSectionDirect manager;
+    
+    // Initialize with default module (ntdll.dll)
+    if (!manager.initialize())
+    {
+        // Handle initialization failure
+        return 1;
+    }
+    
+    // Invoke syscalls
+    NTSTATUS status = manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtClose"),
+        hHandle
+    );
+    
+    return 0;
+}
+```
+
+## See Also
+
+- [Manager Initialization](/api/manager-initialization) - Details on the `initialize()` method
+- [Manager Invocation](/api/manager-invocation) - Details on the `invoke()` method
+- [Policies](/api/policies) - Built-in allocation, stub generation, and parser policies

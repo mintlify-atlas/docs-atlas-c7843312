@@ -1,0 +1,228 @@
+---
+title: generator::direct
+description: Direct syscall stub generation with inline syscall instruction
+---
+
+## Overview
+
+The `generator::direct` policy generates syscall stubs that execute the `syscall` instruction (x64) or `sysenter` (x86) directly within the stub. This is the simplest and most performant approach.
+
+## Constants
+
+<ParamField path="bRequiresGadget" type="static constexpr bool">
+  Indicates whether this policy requires syscall gadgets from ntdll.dll
+  
+  ```cpp
+  static constexpr bool bRequiresGadget = false;
+  ```
+  
+  <ResponseField name="value" type="false">
+    Direct stubs do not require external gadgets
+  </ResponseField>
+</ParamField>
+
+## Method Signatures
+
+<ParamField path="getStubSize" type="static constexpr size_t">
+  Returns the size of the generated stub in bytes
+  
+  ```cpp
+  static constexpr size_t getStubSize()
+  ```
+  
+  <ResponseField name="return" type="size_t">
+    18 bytes on x64, 15 bytes on x86
+  </ResponseField>
+</ParamField>
+
+<ParamField path="generate" type="static void">
+  Generates the syscall stub at the specified buffer
+  
+  ```cpp
+  static void generate(
+      uint8_t* pBuffer,
+      uint32_t uSyscallNumber,
+      void* /*pGadgetAddress*/
+  )
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="pBuffer" type="uint8_t*" required>
+      Pointer to the buffer where the stub will be written
+    </ParamField>
+    <ParamField path="uSyscallNumber" type="uint32_t" required>
+      The syscall number to embed in the stub
+    </ParamField>
+    <ParamField path="pGadgetAddress" type="void*">
+      Unused (direct stubs don't use gadgets)
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Generated Shellcode
+
+### x64 Stub (18 bytes)
+
+From `syscall.hpp:314-322`:
+
+```cpp
+inline static constinit std::array<uint8_t, 18> arrShellcode =
+{
+    0x51,                               // push rcx
+    0x41, 0x5A,                         // pop r10
+    0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0x00000000 (syscall number)
+    0x0F, 0x05,                         // syscall
+    0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+    0xFF, 0x64, 0x24, 0xF8              // jmp qword ptr [rsp-8]
+};
+```
+
+**Assembly breakdown:**
+
+1. `push rcx; pop r10` - Move the first parameter from RCX to R10 (Windows x64 calling convention for syscalls)
+2. `mov eax, <syscall_number>` - Load the syscall number into EAX
+3. `syscall` - Execute the system call
+4. `add rsp, 8` - Clean up the stack (remove the pushed RCX)
+5. `jmp qword ptr [rsp-8]` - Return to the caller
+
+### x86 Stub (15 bytes)
+
+From `syscall.hpp:324-330`:
+
+```cpp
+inline static constinit std::array<uint8_t, 15> arrShellcode =
+{
+    0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0x00000000 (syscall number)
+    0x89, 0xE2,                         // mov edx, esp
+    0x64, 0xFF, 0x15, 0xC0, 0x00, 0x00, 0x00, // call dword ptr fs:[0xC0]
+    0xC3                                // ret
+};
+```
+
+**Assembly breakdown:**
+
+1. `mov eax, <syscall_number>` - Load the syscall number
+2. `mov edx, esp` - Save the stack pointer (required for sysenter)
+3. `call dword ptr fs:[0xC0]` - Call the system service dispatcher (KiFastSystemCall)
+4. `ret` - Return to caller
+
+## Source Code
+
+From `syscall.hpp:309-341`:
+
+```cpp
+struct direct
+{
+    static constexpr bool bRequiresGadget = false;
+
+#if SYSCALL_PLATFORM_WINDOWS_64
+    inline static constinit std::array<uint8_t, 18> arrShellcode =
+    {
+        0x51,                               // push rcx
+        0x41, 0x5A,                         // pop r10
+        0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, syscall number
+        0x0F, 0x05,                         // syscall
+        0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+        0xFF, 0x64, 0x24, 0xF8              // jmp qword ptr [rsp-8]
+    };
+#elif SYSCALL_PLATFORM_WINDOWS_32
+    inline static constinit std::array<uint8_t, 15> arrShellcode =
+    {
+        0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, syscall number
+        0x89, 0xE2,                         // mov edx, esp
+        0x64, 0xFF, 0x15, 0xC0, 0x00, 0x00, 0x00, // call fs:[0xC0]
+        0xC3                                // ret
+    };
+#endif
+    
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* /*pGadgetAddress*/)
+    {
+        std::copy_n(arrShellcode.data(), arrShellcode.size(), pBuffer);
+        if constexpr (platform::isWindows64)
+            *reinterpret_cast<uint32_t*>(pBuffer + 4) = uSyscallNumber;
+        else
+            *reinterpret_cast<uint32_t*>(pBuffer + 1) = uSyscallNumber;
+    }
+    
+    static constexpr size_t getStubSize() { return arrShellcode.size(); }
+};
+```
+
+## Usage Example
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+// Use the pre-defined type alias
+SyscallSectionDirect syscallManager;
+if (!syscallManager.initialize()) {
+    std::cerr << "Failed to initialize\n";
+    return 1;
+}
+
+// Or compose manually
+using DirectManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct
+>;
+
+DirectManager manager;
+manager.initialize();
+
+// Invoke syscalls
+PVOID pAddress = nullptr;
+SIZE_T uSize = 0x1000;
+
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pAddress, 0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+## Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Performance" icon="gauge-high">
+    Fastest approach—no indirection, gadget lookups, or exception handling overhead.
+  </Card>
+  <Card title="Simplicity" icon="star">
+    Straightforward implementation with minimal complexity.
+  </Card>
+  <Card title="Portability" icon="check">
+    Works on both x86 and x64 Windows platforms.
+  </Card>
+  <Card title="Detection" icon="radar">
+    Most easily detected by EDR solutions scanning for direct syscall instructions.
+  </Card>
+</CardGroup>
+
+## Trade-offs
+
+| Aspect | Description |
+|--------|-------------|
+| **Performance** | Excellent (no overhead) |
+| **Stealth** | Low (contains syscall instruction) |
+| **Complexity** | Minimal |
+| **Platform Support** | x86 and x64 |
+| **Use Case** | General purpose, performance-critical |
+
+<Warning>
+While this is the fastest approach, it's also the most detectable. EDR solutions can easily identify direct syscall instructions in user-mode code.
+</Warning>
+
+## See Also
+
+<CardGroup cols={3}>
+  <Card title="generator::gadget" href="/api/policies/generator-gadget">
+    Gadget-based stub generation (x64 only)
+  </Card>
+  <Card title="generator::exception" href="/api/policies/generator-exception">
+    Exception-based stub generation
+  </Card>
+  <Card title="Direct Syscalls Example" href="/examples/direct-syscalls">
+    Complete working example
+  </Card>
+</CardGroup>

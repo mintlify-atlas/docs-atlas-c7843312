@@ -1,0 +1,309 @@
+---
+title: parser::signature
+description: Syscall number resolution via signature scanning with hook detection and halo gates
+---
+
+## Overview
+
+The `parser::signature` policy resolves syscall numbers by scanning function prologues for the signature `mov r10, rcx; mov eax, <syscall_number>` (x64) or `mov eax, <syscall_number>` (x86). It includes hook detection and can resolve syscall numbers from neighboring functions when a target is hooked.
+
+## Method Signature
+
+<ParamField path="parse" type="static std::vector<SyscallEntry_t>">
+  Parses a module to extract syscall numbers via signature scanning
+  
+  ```cpp
+  static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="module" type="const ModuleInfo_t&" required>
+      Module information structure containing base address, NT headers, and export directory
+    </ParamField>
+  </Expandable>
+  
+  <ResponseField name="return" type="std::vector<SyscallEntry_t>">
+    Vector of syscall entries with keys, syscall numbers, and offsets
+  </ResponseField>
+</ParamField>
+
+## Implementation
+
+### Signature Scanning
+
+From `syscall.hpp:455-551`:
+
+```cpp
+static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+{
+    std::vector<SyscallEntry_t> vecFoundSyscalls;
+
+    auto pFunctionsRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+    auto pNamesRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+    auto pOrdinalsRva = reinterpret_cast<uint16_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+    for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; i++)
+    {
+        const char* szName = reinterpret_cast<const char*>(
+            module.m_pModuleBase + pNamesRVA[i]);
+
+        // Only process Nt* functions
+        if (hashing::calculateHashRuntime(szName, 2) != hashing::calculateHash("Nt"))
+            continue;
+
+        uint16_t uOrdinal = pOrdinalsRva[i];
+        uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+
+        // Skip forwarders
+        auto pExportSectionStart = module.m_pNtHeaders->OptionalHeader
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        auto pExportSectionEnd = pExportSectionStart + 
+            module.m_pNtHeaders->OptionalHeader
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (uFunctionRva >= pExportSectionStart && uFunctionRva < pExportSectionEnd)
+            continue;
+
+        uint8_t* pFunctionStart = module.m_pModuleBase + uFunctionRva;
+        uint32_t uSyscallNumber = 0;
+        bool bSyscallFound = false;
+
+        // x64 signature: 4C 8B D1 B8 <syscall_number>
+        if constexpr (platform::isWindows64)
+        {
+            if (*reinterpret_cast<uint32_t*>(pFunctionStart) == 0xB8D18B4C)
+            {
+                uSyscallNumber = *reinterpret_cast<uint32_t*>(pFunctionStart + 4);
+                bSyscallFound = true;
+            }
+        }
+
+        // x86 signature: B8 <syscall_number>
+        if constexpr (platform::isWindows32)
+        {
+            if (*pFunctionStart == 0xB8)
+            {
+                uSyscallNumber = *reinterpret_cast<uint32_t*>(pFunctionStart + 1);
+                bSyscallFound = true;
+            }
+        }
+
+        // Hook detection and halo gates (x64 only)
+        if constexpr (platform::isWindows64)
+        {
+            if (isFunctionHooked(pFunctionStart) && !bSyscallFound)
+            {
+                // Search neighboring functions...
+            }
+        }
+
+        if (bSyscallFound)
+        {
+            const SyscallKey_t key = SYSCALL_ID_RT(szName);
+            vecFoundSyscalls.push_back(SyscallEntry_t{
+                key, uSyscallNumber, 0
+            });
+        }
+    }
+    return vecFoundSyscalls;
+}
+```
+
+## Hook Detection
+
+The `isFunctionHooked` method detects common hooking patterns:
+
+From `syscall.hpp:554-598`:
+
+```cpp
+static bool isFunctionHooked(const uint8_t* pFunctionStart)
+{
+    const uint8_t* pCurrent = pFunctionStart;
+
+    // Skip leading NOPs
+    while (*pCurrent == 0x90)
+        pCurrent++;
+
+    switch (pCurrent[0])
+    {
+        // JMP rel32
+        case 0xE9:
+        // JMP rel8
+        case 0xEB:
+        // PUSH imm32
+        case 0x68:
+            return true;
+
+        // JMP [mem] / JMP [rip + offset]
+        case 0xFF:
+            if (pCurrent[1] == 0x25)
+                return true;
+            break;
+
+        // INT3
+        case 0xCC:
+            return true;
+
+        // UD2
+        case 0x0F:
+            if (pCurrent[1] == 0x0B)
+                return true;
+            break;
+
+        // INT 0x3
+        case 0xCD:
+            if (pCurrent[1] == 0x03)
+                return true;
+            break;
+
+        default:
+            break;
+    }
+
+    return false;
+}
+```
+
+**Detected patterns:**
+
+| Pattern | Bytes | Description |
+|---------|-------|-------------|
+| JMP rel32 | `E9 <offset>` | Relative jump (far) |
+| JMP rel8 | `EB <offset>` | Relative jump (short) |
+| PUSH + RET | `68 <addr>` | Trampoline hook |
+| JMP [mem] | `FF 25 <offset>` | Indirect jump |
+| INT3 | `CC` | Breakpoint |
+| UD2 | `0F 0B` | Illegal instruction |
+| INT 3 | `CD 03` | Software interrupt |
+
+## Halo Gates (x64 Only)
+
+When a function is hooked, the signature parser uses **halo gates** (also known as **HalosGate** or **TartarusGate**) to resolve the syscall number from neighboring functions:
+
+From `syscall.hpp:502-539`:
+
+```cpp
+if (isFunctionHooked(pFunctionStart) && !bSyscallFound)
+{
+    // Search up (previous functions)
+    for (int j = 1; j < 20; ++j)
+    {
+        uint8_t* pNeighborFunc = pFunctionStart - (j * 0x20);
+        if (reinterpret_cast<uintptr_t>(pNeighborFunc) < 
+            reinterpret_cast<uintptr_t>(module.m_pModuleBase)) 
+            break;
+            
+        if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+        {
+            uint32_t uNeighborSyscall = *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+            uSyscallNumber = uNeighborSyscall + j;  // Add offset
+            bSyscallFound = true;
+            break;
+        }
+    }
+
+    // Search down (next functions)
+    if (!bSyscallFound)
+    {
+        for (int j = 1; j < 20; ++j)
+        {
+            uint8_t* pNeighborFunc = pFunctionStart + (j * 0x20);
+            if (reinterpret_cast<uintptr_t>(pNeighborFunc) > 
+                (reinterpret_cast<uintptr_t>(module.m_pModuleBase) + 
+                 module.m_pNtHeaders->OptionalHeader.SizeOfImage)) 
+                break;
+                
+            if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+            {
+                uint32_t uNeighborSyscall = *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+                uSyscallNumber = uNeighborSyscall - j;  // Subtract offset
+                bSyscallFound = true;
+                break;
+            }
+        }
+    }
+}
+```
+
+**How it works:**
+
+1. If a function is hooked (signature not found), search neighboring functions
+2. **Search upward**: Check the previous 20 functions (at 0x20-byte intervals)
+3. If an unhooked neighbor is found, calculate: `syscall_number = neighbor_syscall + distance`
+4. **Search downward**: If upward search fails, check the next 20 functions
+5. Calculate: `syscall_number = neighbor_syscall - distance`
+
+<Info>
+This technique assumes syscalls are laid out sequentially in memory at 0x20-byte intervals, which is true for ntdll.dll on x64.
+</Info>
+
+## Advantages
+
+<CardGroup cols={2}>
+  <Card title="Hook Resilience" icon="shield">
+    Can resolve syscall numbers even when the target function is hooked, using neighboring unhooked functions.
+  </Card>
+  <Card title="Direct Reading" icon="eye">
+    Reads syscall numbers directly from function prologues, no inference needed.
+  </Card>
+  <Card title="Platform Support" icon="check">
+    Works on both x86 and x64 (though halo gates are x64-only).
+  </Card>
+  <Card title="Fallback Parser" icon="rotate">
+    Ideal as a fallback when directory-based parsing fails.
+  </Card>
+</CardGroup>
+
+## Usage
+
+This parser is used in the `DefaultParserChain` as a fallback:
+
+```cpp
+using DefaultParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,    // Primary
+    syscall::policies::parser::signature     // Fallback
+>;
+```
+
+You can also use it as the primary parser:
+
+```cpp
+using SignatureOnlyManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct,
+    syscall::policies::parser::signature
+>;
+
+SignatureOnlyManager manager;
+manager.initialize();
+```
+
+## Limitations
+
+<Warning>
+**x86 Halo Gates:** The halo gates technique is only implemented for x64. On x86, if a function is hooked and the signature is not found, that syscall will be skipped.
+
+**Heavy Hooking:** If many consecutive functions are hooked (more than 20 in a row), halo gates may fail to find an unhooked neighbor.
+</Warning>
+
+## Trade-offs
+
+| Aspect | Description |
+|--------|-------------|
+| **Resilience** | High (hook detection + halo gates) |
+| **Performance** | Slower (scans all exports) |
+| **Reliability** | Medium (depends on function layout) |
+| **Platform** | x86 and x64 (halo gates x64 only) |
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="parser::directory" href="/api/policies/parser-directory">
+    Directory-based parser (primary method)
+  </Card>
+  <Card title="ParserChain_t" href="/core-concepts/policy-composition">
+    Learn about parser fallback chains
+  </Card>
+</CardGroup>

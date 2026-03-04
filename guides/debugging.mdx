@@ -1,0 +1,538 @@
+---
+title: Debugging
+description: Techniques for troubleshooting syscalls-cpp initialization, verifying syscall numbers, and testing custom policies
+---
+
+## Overview
+
+Debugging syscall implementations can be challenging due to their low-level nature. This guide covers techniques for troubleshooting initialization failures, verifying syscall numbers, and testing your custom policies.
+
+## SYSCALLS_NO_HASH Macro
+
+The most important debugging tool is the `SYSCALLS_NO_HASH` macro, which disables compile-time hashing and uses plain strings instead.
+
+### Enabling Debug Mode
+
+<CodeGroup>
+```bash MSVC
+cl /DSYSCALLS_NO_HASH your_program.cpp
+```
+
+```bash GCC/Clang
+g++ -DSYSCALLS_NO_HASH your_program.cpp
+```
+
+```cmake CMake
+target_compile_definitions(your_target PRIVATE SYSCALLS_NO_HASH)
+```
+</CodeGroup>
+
+### How It Works
+
+When `SYSCALLS_NO_HASH` is defined, the library switches from compile-time hashed identifiers to runtime strings:
+
+```cpp
+#ifdef SYSCALLS_NO_HASH
+    using SyscallKey_t = std::string;
+#else
+    using SyscallKey_t = hashing::Hash_t;
+#endif
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:35-39*
+
+### Benefits
+
+<CardGroup cols={2}>
+  <Card title="Debugger Visibility" icon="eye">
+    View syscall names as strings in your debugger's watch window instead of cryptic hash values.
+  </Card>
+  
+  <Card title="Breakpoint Clarity" icon="location-dot">
+    Set conditional breakpoints based on syscall names: `if (syscallId == "NtAllocateVirtualMemory")`
+  </Card>
+  
+  <Card title="Logging" icon="file-lines">
+    Print actual syscall names in log messages for easier troubleshooting.
+  </Card>
+  
+  <Card title="Testing" icon="vial">
+    Verify that syscalls are being resolved correctly by name.
+  </Card>
+</CardGroup>
+
+<Warning>
+Only use `SYSCALLS_NO_HASH` during development. Production builds should use hashed identifiers for security and performance.
+</Warning>
+
+## Troubleshooting Initialization Failures
+
+The `initialize()` method can fail for several reasons. Here's how to diagnose each one.
+
+### Step-by-Step Debugging
+
+#### 1. Check Return Value
+
+Always verify the return value:
+
+```cpp
+syscall::Manager<syscall::policies::allocator::section, 
+                 syscall::policies::generator::direct> syscallManager;
+
+if (!syscallManager.initialize())
+{
+    std::cerr << "Initialization failed!" << std::endl;
+    return 1;
+}
+```
+
+*Source: examples/basic-usage.cpp:6-10*
+
+#### 2. Verify Gadget Requirements
+
+If using a policy that requires gadgets (like `generator::gadget` or `generator::exception`), ensure gadgets are found:
+
+```cpp
+bool findSyscallGadgets()
+{
+    ModuleInfo_t ntdll;
+    if (!getModuleInfo(SYSCALL_ID("ntdll.dll"), ntdll))
+        return false;
+
+    // Search for 'syscall; ret' (0x0F 0x05 0xC3) in .text section
+    m_vecSyscallGadgets.clear();
+    for (DWORD i = 0; i < uTextSectionSize - 2; ++i)
+        if (pTextSection[i] == 0x0F && 
+            pTextSection[i + 1] == 0x05 && 
+            pTextSection[i + 2] == 0xC3)
+            m_vecSyscallGadgets.push_back(&pTextSection[i]);
+
+    return !m_vecSyscallGadgets.empty();
+}
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:896-924*
+
+**Debug tip:** Add logging to see how many gadgets were found:
+
+```cpp
+std::cout << "Found " << m_vecSyscallGadgets.size() << " syscall gadgets" << std::endl;
+```
+
+#### 3. Verify Module Loading
+
+Ensure the target modules (e.g., `ntdll.dll`) are loaded:
+
+```cpp
+bool getModuleInfo(SyscallKey_t moduleKey, ModuleInfo_t& info)
+{
+    HMODULE hModule = native::getModuleBase(moduleKey);
+    if (!hModule)
+        return false;  // Module not loaded!
+
+    info.m_pModuleBase = reinterpret_cast<uint8_t*>(hModule);
+    // ... validate PE headers
+}
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:870-893*
+
+**Debug tip:** Print module base addresses:
+
+```cpp
+HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+std::cout << "ntdll.dll base: 0x" << std::hex << hNtdll << std::endl;
+```
+
+#### 4. Check Parsing Results
+
+Verify that syscalls were parsed successfully:
+
+```cpp
+std::vector<SyscallEntry_t> vecSyscalls = parser::directory::parse(moduleInfo);
+
+if (vecSyscalls.empty())
+{
+    std::cerr << "Parser failed to find any syscalls" << std::endl;
+    return false;
+}
+```
+
+**Debug tip:** Count parsed syscalls:
+
+```cpp
+std::cout << "Parsed " << m_vecParsedSyscalls.size() << " syscalls" << std::endl;
+```
+
+#### 5. Verify Memory Allocation
+
+Ensure the allocation policy succeeds:
+
+```cpp
+bool createSyscalls()
+{
+    if (m_vecParsedSyscalls.empty())
+        return false;
+
+    m_uRegionSize = m_vecParsedSyscalls.size() * 
+                    IStubGenerationPolicy::getStubSize();
+    std::vector<uint8_t> vecTempBuffer(m_uRegionSize);
+
+    // Generate stubs...
+
+    return IAllocationPolicy::allocate(m_uRegionSize, vecTempBuffer, 
+                                      m_pSyscallRegion, m_hObjectHandle);
+}
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:837-868*
+
+**Debug tip:** Log allocation details:
+
+```cpp
+std::cout << "Allocating " << m_uRegionSize << " bytes" << std::endl;
+std::cout << "Region allocated at: 0x" << std::hex << m_pSyscallRegion << std::endl;
+```
+
+## Verifying Syscall Numbers
+
+Syscall numbers can vary between Windows versions. Here's how to verify you're getting correct numbers.
+
+### Manual Verification with WinDbg
+
+1. Attach WinDbg to your process
+2. Disassemble the target syscall in ntdll:
+
+```
+0:000> u ntdll!NtAllocateVirtualMemory
+ntdll!NtAllocateVirtualMemory:
+00007ffc`9876b540 4c8bd1          mov     r10,rcx
+00007ffc`9876b543 b818000000      mov     eax,18h      ; <-- Syscall number
+00007ffc`9876b548 f604250803fe7f01 test    byte ptr [SharedUserData+0x308],1
+00007ffc`9876b550 7503            jne     ntdll!NtAllocateVirtualMemory+0x15
+00007ffc`9876b552 0f05            syscall
+00007ffc`9876b554 c3              ret
+```
+
+The `mov eax, 18h` instruction shows the syscall number is `0x18` (24 in decimal).
+
+### Runtime Verification
+
+Add logging to verify parsed syscall numbers:
+
+```cpp
+#ifdef SYSCALLS_NO_HASH
+// With debug mode, you can print actual names
+for (const auto& entry : m_vecParsedSyscalls)
+{
+    std::cout << entry.m_key << " = 0x" << std::hex << entry.m_uSyscallNumber 
+              << " @ offset 0x" << entry.m_uOffset << std::endl;
+}
+#endif
+```
+
+### Comparison with Known Values
+
+Create a test to validate against known syscall numbers for your Windows version:
+
+```cpp
+void validateSyscallNumbers()
+{
+    struct KnownSyscall
+    {
+        const char* name;
+        uint32_t expectedNumber;  // For your Windows version
+    };
+
+    const KnownSyscall knownSyscalls[] = {
+        { "NtAllocateVirtualMemory", 0x18 },
+        { "NtProtectVirtualMemory", 0x50 },
+        { "NtQueryInformationProcess", 0x19 },
+        // ... more syscalls
+    };
+
+    for (const auto& known : knownSyscalls)
+    {
+        auto it = std::ranges::find_if(m_vecParsedSyscalls, 
+            [&](const SyscallEntry_t& e) { 
+                return e.m_key == SYSCALL_ID(known.name); 
+            });
+
+        if (it != m_vecParsedSyscalls.end())
+        {
+            if (it->m_uSyscallNumber != known.expectedNumber)
+            {
+                std::cerr << "Mismatch for " << known.name 
+                         << ": expected 0x" << std::hex << known.expectedNumber
+                         << ", got 0x" << it->m_uSyscallNumber << std::endl;
+            }
+        }
+    }
+}
+```
+
+## Testing Stub Generation
+
+Verify that your stub generation produces valid machine code.
+
+### Disassemble Generated Stubs
+
+Use a disassembler library or external tool to verify the generated code:
+
+```cpp
+void dumpGeneratedStub(uint8_t* pStub, size_t uSize)
+{
+    std::cout << "Stub at 0x" << std::hex << 
+                 reinterpret_cast<uintptr_t>(pStub) << ":" << std::endl;
+    
+    for (size_t i = 0; i < uSize; ++i)
+    {
+        std::cout << std::setw(2) << std::setfill('0') << std::hex 
+                  << static_cast<int>(pStub[i]) << " ";
+        if ((i + 1) % 16 == 0)
+            std::cout << std::endl;
+    }
+    std::cout << std::endl;
+}
+
+// Usage
+uint8_t testBuffer[128];
+generator::direct::generate(testBuffer, 0x18, nullptr);
+dumpGeneratedStub(testBuffer, generator::direct::getStubSize());
+```
+
+**Expected output for x64 direct generator:**
+```
+Stub at 0x...
+51 41 5a b8 18 00 00 00 0f 05 48 83 c4 08 ff 64 24 f8
+```
+
+This matches the shellcode pattern:
+- `51` = push rcx
+- `41 5a` = pop r10
+- `b8 18 00 00 00` = mov eax, 0x18
+- `0f 05` = syscall
+- ... etc
+
+*Source: include/syscalls-cpp/syscall.hpp:314-322*
+
+### Test Stub Execution
+
+Create a minimal test that invokes a safe syscall:
+
+```cpp
+void testStubExecution()
+{
+    syscall::Manager<syscall::policies::allocator::memory, 
+                     syscall::policies::generator::direct> manager;
+    
+    if (!manager.initialize())
+    {
+        std::cerr << "Initialization failed" << std::endl;
+        return;
+    }
+
+    // Test with a safe syscall
+    LARGE_INTEGER tickCount;
+    NTSTATUS status = manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtQuerySystemTime"),
+        &tickCount
+    );
+
+    if (NT_SUCCESS(status))
+        std::cout << "Stub execution successful!" << std::endl;
+    else
+        std::cerr << "Stub execution failed with status: 0x" 
+                  << std::hex << status << std::endl;
+}
+```
+
+## Debugging Custom Policies
+
+### Allocation Policy Debugging
+
+Add logging to track allocation behavior:
+
+```cpp
+struct DebugAllocator
+{
+    static bool allocate(size_t uRegionSize, 
+                        const std::span<const uint8_t> vecBuffer, 
+                        void*& pOutRegion, 
+                        HANDLE& hOutHandle)
+    {
+        std::cout << "[DebugAllocator] Allocating " << uRegionSize 
+                  << " bytes" << std::endl;
+
+        // Your allocation logic
+        bool result = /* ... */;
+
+        if (result)
+            std::cout << "[DebugAllocator] Allocated at: 0x" 
+                      << std::hex << pOutRegion << std::endl;
+        else
+            std::cerr << "[DebugAllocator] Allocation failed!" << std::endl;
+
+        return result;
+    }
+
+    static void release(void* pRegion, HANDLE hHandle)
+    {
+        std::cout << "[DebugAllocator] Releasing region at: 0x" 
+                  << std::hex << pRegion << std::endl;
+        // Your release logic
+    }
+};
+```
+
+### Stub Generation Policy Debugging
+
+Validate generated stub size and contents:
+
+```cpp
+struct DebugGenerator
+{
+    static constexpr bool bRequiresGadget = false;
+    
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadget)
+    {
+        std::cout << "[DebugGenerator] Generating stub for syscall 0x" 
+                  << std::hex << uSyscallNumber << std::endl;
+
+        // Your generation logic
+        // ...
+
+        // Verify what was written
+        std::cout << "[DebugGenerator] First 4 bytes: ";
+        for (int i = 0; i < 4; ++i)
+            std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                      << static_cast<int>(pBuffer[i]) << " ";
+        std::cout << std::endl;
+    }
+
+    static constexpr size_t getStubSize() 
+    { 
+        constexpr size_t size = 32;
+        std::cout << "[DebugGenerator] Stub size: " << size << std::endl;
+        return size; 
+    }
+};
+```
+
+### Parsing Policy Debugging
+
+Trace parsing logic and results:
+
+```cpp
+struct DebugParser
+{
+    static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+    {
+        std::cout << "[DebugParser] Parsing module at: 0x" 
+                  << std::hex << reinterpret_cast<uintptr_t>(module.m_pModuleBase) 
+                  << std::endl;
+
+        std::vector<SyscallEntry_t> results;
+        
+        // Your parsing logic
+        for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; i++)
+        {
+            const char* szName = /* ... */;
+            
+            #ifdef SYSCALLS_NO_HASH
+            std::cout << "[DebugParser] Found: " << szName 
+                      << " (syscall #" << std::dec << uSyscallNumber << ")" 
+                      << std::endl;
+            #endif
+            
+            // ... add to results
+        }
+
+        std::cout << "[DebugParser] Total syscalls found: " 
+                  << results.size() << std::endl;
+        return results;
+    }
+};
+```
+
+## Common Issues and Solutions
+
+<AccordionGroup>
+  <Accordion title="Issue: Initialize returns false">
+    **Possible causes:**
+    - Module not loaded (ensure ntdll.dll is accessible)
+    - Parser returned empty results (check PE structure)
+    - Allocation failed (check memory permissions)
+    - Gadgets not found (verify .text section exists)
+
+    **Solution:**
+    Enable `SYSCALLS_NO_HASH` and add logging at each initialization step.
+  </Accordion>
+
+  <Accordion title="Issue: Invoke crashes immediately">
+    **Possible causes:**
+    - Incorrect stub generation (disassemble and verify)
+    - Wrong calling convention (check parameter passing)
+    - Memory permissions incorrect (verify RX permissions)
+    - Stack misalignment (check stack pointer adjustments)
+
+    **Solution:**
+    Use a debugger to step through the generated stub. Verify the instruction sequence matches your expectation.
+  </Accordion>
+
+  <Accordion title="Issue: Wrong syscall number">
+    **Possible causes:**
+    - Parser using wrong algorithm for Windows version
+    - Hooked functions not detected properly
+    - Module version mismatch
+
+    **Solution:**
+    Manually verify syscall numbers in WinDbg and compare with parsed results. Use the signature parser as a fallback.
+  </Accordion>
+
+  <Accordion title="Issue: Syscall not found">
+    **Possible causes:**
+    - Typo in syscall name
+    - Syscall in different module (win32u.dll, etc.)
+    - Hash collision (rare)
+
+    **Solution:**
+    Enable `SYSCALLS_NO_HASH` to verify the exact name being looked up. Ensure you're parsing the correct modules.
+  </Accordion>
+</AccordionGroup>
+
+## Testing Best Practices
+
+<Steps>
+  <Step title="Test in Debug Mode First">
+    Always develop and test with `SYSCALLS_NO_HASH` enabled for maximum visibility.
+  </Step>
+  
+  <Step title="Test Safe Syscalls First">
+    Start with syscalls that won't crash if they fail (like `NtQuerySystemTime`).
+  </Step>
+  
+  <Step title="Verify on Multiple Windows Versions">
+    Syscall numbers change between Windows versions. Test on all target platforms.
+  </Step>
+  
+  <Step title="Test with Security Products">
+    If you're bypassing hooks, test with EDR/AV products to ensure your technique works.
+  </Step>
+  
+  <Step title="Build Automated Tests">
+    Create unit tests for each custom policy to catch regressions early.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Security Considerations" icon="shield" href="/guides/security-considerations">
+    Learn about critical security issues and best practices
+  </Card>
+  
+  <Card title="Custom Policies" icon="wrench" href="/guides/custom-policies">
+    Understand how to write and test custom policies
+  </Card>
+</CardGroup>

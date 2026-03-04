@@ -1,0 +1,373 @@
+---
+title: "Allocation Policies"
+description: "Deep dive into the three allocation strategies for storing syscall stubs: section-based, heap-based, and memory-based allocation"
+---
+
+## Overview
+
+Allocation policies control **where and how** syscall stubs are stored in memory. Each policy offers different security and operational characteristics, allowing you to choose the right tradeoff for your use case.
+
+All allocation policies must satisfy the `IsIAllocationPolicy` concept by providing:
+- `static bool allocate(size_t uRegionSize, const std::span<const uint8_t> vecBuffer, void*& pOutRegion, HANDLE& hOutHandle)`
+- `static void release(void* pRegion, HANDLE hHandle)`
+
+## allocator::section
+
+### Overview
+
+The `section` allocator uses `NtCreateSection` with the **`SEC_NO_CHANGE`** flag to create immutable memory regions. This is the most secure option as it prevents modification of syscall stubs even by code running at the same privilege level.
+
+<Info>
+**Security Highlight**: `SEC_NO_CHANGE` (also known as `SEC_PROTECTED_IMAGE`) makes the memory region immutable. Attempts to modify the section will fail with `STATUS_SECTION_PROTECTION`, even from the same process.
+</Info>
+
+### Implementation Details
+
+Location: `syscall.hpp:115-165`
+
+```cpp
+struct section
+{
+    static bool allocate(size_t uRegionSize, const std::span<const uint8_t> vecBuffer, void*& pOutRegion, HANDLE& /*unused*/)
+    {
+        HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+
+        auto fNtCreateSection = reinterpret_cast<native::NtCreateSection_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtCreateSection")));
+        auto fNtMapView = reinterpret_cast<native::NtMapViewOfSection_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtMapViewOfSection")));
+        auto fNtUnmapView = reinterpret_cast<native::NtUnmapViewOfSection_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtUnmapViewOfSection")));
+        auto fNtClose = reinterpret_cast<native::NtClose_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtClose")));
+        
+        if (!fNtCreateSection || !fNtMapView || !fNtUnmapView || !fNtClose)
+            return false;
+
+        HANDLE hSectionHandle = nullptr;
+        LARGE_INTEGER sectionSize;
+        sectionSize.QuadPart = uRegionSize;
+
+        // Create section with SEC_NO_CHANGE flag
+        NTSTATUS status = fNtCreateSection(&hSectionHandle, SECTION_ALL_ACCESS, nullptr, &sectionSize, 
+            PAGE_EXECUTE_READWRITE, SEC_COMMIT | static_cast<ULONG>(SECTION_NO_CHANGE), nullptr);
+        
+        if (!NT_SUCCESS(status))
+            return false;
+
+        // Map as RW to write stub data
+        void* pTempView = nullptr;
+        SIZE_T uViewSize = uRegionSize;
+        status = fNtMapView(hSectionHandle, native::getCurrentProcess(), &pTempView, 0, 0, nullptr, &uViewSize, VIEW_SHARE, 0, PAGE_READWRITE);
+        
+        if (!NT_SUCCESS(status))
+        {
+            fNtClose(hSectionHandle);
+            return false;
+        }
+
+        // Copy stub data
+        std::copy_n(vecBuffer.data(), uRegionSize, static_cast<uint8_t*>(pTempView));
+        
+        // Unmap the RW view
+        fNtUnmapView(native::getCurrentProcess(), pTempView);
+        
+        // Re-map as RX (now immutable due to SEC_NO_CHANGE)
+        uViewSize = uRegionSize;
+        status = fNtMapView(hSectionHandle, native::getCurrentProcess(), &pOutRegion, 0, 0, nullptr, &uViewSize, 
+            native::ESectionInherit::VIEW_SHARE, 0, PAGE_EXECUTE_READ);
+        
+        fNtClose(hSectionHandle);
+        return NT_SUCCESS(status) && pOutRegion;
+    }
+    
+    static void release(void* pRegion, HANDLE /*hHeapHandle*/)
+    {
+        HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+        if (pRegion)
+        {
+            auto fNtUnmapView = reinterpret_cast<native::NtUnmapViewOfSection_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtUnmapViewOfSection")));
+            if (fNtUnmapView)
+                fNtUnmapView(native::getCurrentProcess(), pRegion);
+        }
+    }
+};
+```
+
+### Allocation Process
+
+1. **Create Section**: `NtCreateSection` with `SEC_COMMIT | SEC_NO_CHANGE` flags
+2. **Map as RW**: First mapping with `PAGE_READWRITE` to copy stub data
+3. **Copy Stubs**: Write generated syscall stubs to the temporary view
+4. **Unmap RW View**: Remove the writable mapping
+5. **Map as RX**: Final mapping with `PAGE_EXECUTE_READ` (now immutable)
+6. **Close Handle**: Section handle is closed; the memory remains mapped
+
+### Security Implications
+
+<Warning>
+**Immutability**: Once created, syscall stubs **cannot be modified** by any code in the process. This protects against:
+- Runtime hooking attempts
+- Memory corruption
+- Inline patching
+</Warning>
+
+<Check>**Best for**: Maximum security when stub immutability is critical</Check>
+
+### Trade-offs
+
+| Advantage | Disadvantage |
+|-----------|-------------|
+| Immutable after creation | More complex allocation process |
+| Strong protection against tampering | Requires multiple API calls |
+| No runtime modification possible | Cannot update stubs dynamically |
+
+## allocator::heap
+
+### Overview
+
+The `heap` allocator creates a dedicated executable heap using `RtlCreateHeap` with the **`HEAP_CREATE_ENABLE_EXECUTE`** flag. This provides good isolation while maintaining simplicity.
+
+### Implementation Details
+
+Location: `syscall.hpp:167-209`
+
+```cpp
+struct heap
+{
+    static bool allocate(size_t uRegionSize, const std::span<const uint8_t> vecBuffer, void*& pOutRegion, HANDLE& hOutHeapHandle)
+    {
+        HMODULE hNtdll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+        if (!hNtdll)
+            return false;
+
+        auto fRtlCreateHeap = reinterpret_cast<native::RtlCreateHeap_t>(native::getExportAddress(hNtdll, SYSCALL_ID("RtlCreateHeap")));
+        auto fRtlAllocateHeap = reinterpret_cast<native::RtlAllocateHeap_t>(native::getExportAddress(hNtdll, SYSCALL_ID("RtlAllocateHeap")));
+        
+        if (!fRtlCreateHeap || !fRtlAllocateHeap)
+            return false;
+
+        // Create executable heap
+        hOutHeapHandle = fRtlCreateHeap(HEAP_CREATE_ENABLE_EXECUTE | HEAP_GROWABLE, nullptr, 0, 0, nullptr, nullptr);
+        if (!hOutHeapHandle)
+            return false;
+
+        // Allocate memory from the heap
+        pOutRegion = fRtlAllocateHeap(hOutHeapHandle, 0, uRegionSize);
+        if (!pOutRegion)
+        {
+            release(nullptr, hOutHeapHandle);
+            hOutHeapHandle = nullptr;
+            return false;
+        }
+
+        // Copy stub data
+        std::copy_n(vecBuffer.data(), uRegionSize, static_cast<uint8_t*>(pOutRegion));
+        return true;
+    }
+
+    static void release(void* /*region*/, HANDLE hHeapHandle)
+    {
+        if (hHeapHandle)
+        {
+            HMODULE hNtdll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+            if (!hNtdll)
+                return;
+
+            auto fRtlDestroyHeap = reinterpret_cast<native::RtlDestroyHeap_t>(native::getExportAddress(hNtdll, SYSCALL_ID("RtlDestroyHeap")));
+            if (fRtlDestroyHeap)
+                fRtlDestroyHeap(hHeapHandle);
+        }
+    }
+};
+```
+
+### Allocation Process
+
+1. **Create Heap**: `RtlCreateHeap` with `HEAP_CREATE_ENABLE_EXECUTE | HEAP_GROWABLE`
+2. **Allocate**: `RtlAllocateHeap` to get memory from the executable heap
+3. **Copy Stubs**: Write syscall stubs directly to the allocated region
+4. **Cleanup**: `RtlDestroyHeap` destroys the entire heap on release
+
+### Security Implications
+
+<Info>
+**Isolation**: Dedicated heap separate from default process heap. Memory is executable by design via `HEAP_CREATE_ENABLE_EXECUTE`.
+</Info>
+
+<Warning>
+**Mutability**: Unlike `section`, heap memory can be modified at runtime. This allows for dynamic updates but also makes it vulnerable to tampering.
+</Warning>
+
+<Check>**Best for**: Balanced approach with good isolation and simplicity</Check>
+
+### Trade-offs
+
+| Advantage | Disadvantage |
+|-----------|-------------|
+| Simple allocation API | Memory is mutable |
+| Dedicated heap isolation | Vulnerable to runtime modification |
+| Efficient for many stubs | No inherent protection against hooks |
+
+## allocator::memory
+
+### Overview
+
+The `memory` allocator uses standard virtual memory allocation via `NtAllocateVirtualMemory`, initially as `PAGE_READWRITE`, then transitions to `PAGE_EXECUTE_READ` via `NtProtectVirtualMemory`.
+
+### Implementation Details
+
+Location: `syscall.hpp:211-259`
+
+```cpp
+struct memory
+{
+    static bool allocate(size_t uRegionSize, const std::span<const uint8_t> vecBuffer, void*& pOutRegion, HANDLE& /*unused*/)
+    {
+        HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+
+        auto fNtAllocate = reinterpret_cast<native::NtAllocateVirtualMemory_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtAllocateVirtualMemory")));
+        auto fNtProtect = reinterpret_cast<native::NtProtectVirtualMemory_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtProtectVirtualMemory")));
+        
+        if (!fNtAllocate || !fNtProtect)
+            return false;
+
+        // Allocate as RW
+        pOutRegion = nullptr;
+        SIZE_T uSize = uRegionSize;
+        NTSTATUS status = fNtAllocate(native::getCurrentProcess(), &pOutRegion, 0, &uSize, 
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        if (!NT_SUCCESS(status) || !pOutRegion)
+            return false;
+
+        // Copy stub data
+        std::copy_n(vecBuffer.data(), uRegionSize, static_cast<uint8_t*>(pOutRegion));
+        
+        // Transition to RX
+        ULONG oldProtection = 0;
+        uSize = uRegionSize;
+        status = fNtProtect(native::getCurrentProcess(), &pOutRegion, &uSize, PAGE_EXECUTE_READ, &oldProtection);
+
+        if (!NT_SUCCESS(status))
+        {
+            // Cleanup on failure
+            uSize = 0;
+            fNtAllocate(native::getCurrentProcess(), &pOutRegion, 0, &uSize, MEM_RELEASE, 0);
+            pOutRegion = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    static void release(void* pRegion, HANDLE /*heapHandle*/)
+    {
+        HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+
+        if (pRegion)
+        {
+            auto fNtFree = reinterpret_cast<native::NtFreeVirtualMemory_t>(native::getExportAddress(hNtDll, SYSCALL_ID("NtFreeVirtualMemory")));
+            if (fNtFree)
+            {
+                SIZE_T uSize = 0;
+                fNtFree(native::getCurrentProcess(), &pRegion, &uSize, MEM_RELEASE);
+            }
+        }
+    }
+};
+```
+
+### Allocation Process
+
+1. **Allocate RW**: `NtAllocateVirtualMemory` with `PAGE_READWRITE`
+2. **Copy Stubs**: Write syscall stubs to the allocated region
+3. **Transition to RX**: `NtProtectVirtualMemory` changes protection to `PAGE_EXECUTE_READ`
+4. **Cleanup**: `NtFreeVirtualMemory` releases the memory on destruction
+
+### Security Implications
+
+<Info>
+**Standard Approach**: RW → RX transition is a common pattern for JIT/dynamic code generation.
+</Info>
+
+<Warning>
+**Protection Can Be Changed**: Unlike `SEC_NO_CHANGE`, protection can be changed back to RW via `VirtualProtect` or `NtProtectVirtualMemory`, making stubs vulnerable to modification.
+</Warning>
+
+<Check>**Best for**: Simplicity and compatibility when immutability is not required</Check>
+
+### Trade-offs
+
+| Advantage | Disadvantage |
+|-----------|-------------|
+| Simple two-step process | Protection is not enforced |
+| Most compatible approach | Can be changed back to RW |
+| Standard memory management | Vulnerable to tampering |
+
+## Comparison Matrix
+
+| Feature | `section` | `heap` | `memory` |
+|---------|-----------|--------|----------|
+| **Immutability** | ✅ Enforced | ❌ No | ❌ No |
+| **Complexity** | High | Medium | Low |
+| **API Calls** | 4+ | 2 | 2 |
+| **Isolation** | Section object | Dedicated heap | Process memory |
+| **Modification** | Impossible | Possible | Possible |
+| **Security** | Maximum | Good | Standard |
+| **OPSEC** | Excellent | Good | Fair |
+
+## Choosing the Right Policy
+
+<Steps>
+  <Step title="Maximum Security">
+    Use `allocator::section` when stub immutability is critical and you need protection against runtime modification attempts.
+  </Step>
+  
+  <Step title="Balanced Approach">
+    Use `allocator::heap` for good isolation with simpler implementation and dedicated heap management.
+  </Step>
+  
+  <Step title="Simplicity First">
+    Use `allocator::memory` when compatibility and simplicity are priorities and immutability is not required.
+  </Step>
+</Steps>
+
+## Usage Examples
+
+<CodeGroup>
+```cpp Section Allocator
+using SecureManager = syscall::Manager<
+    syscall::policies::allocator::section,  // Immutable stubs
+    syscall::policies::generator::direct,
+    syscall::DefaultParserChain
+>;
+
+SecureManager manager;
+manager.initialize();
+```
+
+```cpp Heap Allocator
+using HeapManager = syscall::Manager<
+    syscall::policies::allocator::heap,     // Isolated heap
+    syscall::policies::generator::gadget,
+    syscall::DefaultParserChain
+>;
+
+HeapManager manager;
+manager.initialize();
+```
+
+```cpp Memory Allocator
+using SimpleManager = syscall::Manager<
+    syscall::policies::allocator::memory,   // Simple RW->RX
+    syscall::policies::generator::direct,
+    syscall::DefaultParserChain
+>;
+
+SimpleManager manager;
+manager.initialize();
+```
+</CodeGroup>
+
+## Next Steps
+
+<Card title="Stub Generation Policies" icon="microchip" href="/core-concepts/stub-generation-policies">
+  Learn how syscall stubs are generated and executed
+</Card>

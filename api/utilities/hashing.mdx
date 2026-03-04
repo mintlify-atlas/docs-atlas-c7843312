@@ -1,0 +1,210 @@
+---
+title: "Hashing"
+description: "Compile-time and runtime string hashing utilities for syscall obfuscation"
+---
+
+## Overview
+
+The `syscall::hashing` namespace provides compile-time and runtime string hashing functions used for obfuscating syscall names and API references. The hashing system uses a custom algorithm with compile-time generated seeds to make analysis more difficult.
+
+## Namespace
+
+```cpp
+namespace syscall::hashing
+```
+
+## Type Definitions
+
+### Hash_t
+
+```cpp
+using Hash_t = uint64_t;
+```
+
+The hash type used throughout the library for storing hash values.
+
+## Compile-Time Seed Generation
+
+### getCompileTimeSeed
+
+```cpp
+constexpr Hash_t getCompileTimeSeed();
+```
+
+Generates a unique seed at compile time based on `__TIME__` and `__DATE__` macros. This ensures each compilation produces different hash values.
+
+**Returns:** A unique 64-bit seed value based on compilation timestamp.
+
+### Seed Constants
+
+```cpp
+constexpr Hash_t currentSeed = getCompileTimeSeed();
+constexpr Hash_t polyKey1 = 0xAF6F01BD5B2D7583ULL ^ currentSeed;
+constexpr Hash_t polyKey2 = 0xB4F281729182741DULL ^ std::rotr(currentSeed, 7);
+```
+
+Pre-calculated polynomial keys used in the hashing algorithm, XORed with the compile-time seed.
+
+## Compile-Time Hashing
+
+### calculateHash (null-terminated)
+
+```cpp
+consteval Hash_t calculateHash(const char* szData);
+```
+
+Computes a hash value at compile time for a null-terminated string.
+
+**Parameters:**
+- `szData` - Null-terminated string to hash
+
+**Returns:** 64-bit hash value
+
+**Usage:**
+```cpp
+constexpr auto hash = syscall::hashing::calculateHash("NtAllocateVirtualMemory");
+```
+
+### calculateHash (with length)
+
+```cpp
+consteval Hash_t calculateHash(const char* szData, size_t uLength);
+```
+
+Computes a hash value at compile time for a string with specified length.
+
+**Parameters:**
+- `szData` - String to hash
+- `uLength` - Maximum length to hash (stops at null terminator if encountered first)
+
+**Returns:** 64-bit hash value
+
+## Runtime Hashing
+
+### calculateHashRuntime (null-terminated)
+
+```cpp
+inline Hash_t calculateHashRuntime(const char* szData);
+```
+
+Computes a hash value at runtime for a null-terminated string.
+
+**Parameters:**
+- `szData` - Null-terminated string to hash
+
+**Returns:** 64-bit hash value
+
+### calculateHashRuntime (with length)
+
+```cpp
+inline Hash_t calculateHashRuntime(const char* szData, size_t uLength);
+```
+
+Computes a hash value at runtime for a string with specified length.
+
+**Parameters:**
+- `szData` - String to hash
+- `uLength` - Maximum length to hash (stops at null terminator if encountered first)
+
+**Returns:** 64-bit hash value
+
+### calculateHashRuntime (string_view)
+
+```cpp
+inline Hash_t calculateHashRuntime(std::string_view sv);
+```
+
+Computes a hash value at runtime for a `std::string_view`.
+
+**Parameters:**
+- `sv` - String view to hash
+
+**Returns:** 64-bit hash value
+
+## Macros
+
+### SYSCALL_ID
+
+```cpp
+SYSCALL_ID(str)
+```
+
+Convenience macro for compile-time hashing. When `SYSCALLS_NO_HASH` is defined, returns the string as-is. Otherwise, computes the hash at compile time.
+
+**Parameters:**
+- `str` - String literal to hash
+
+**Returns:** Either `Hash_t` (default) or `const char*` (if `SYSCALLS_NO_HASH` defined)
+
+**Usage:**
+```cpp
+auto key = SYSCALL_ID("NtAllocateVirtualMemory");
+```
+
+### SYSCALL_ID_RT
+
+```cpp
+SYSCALL_ID_RT(str)
+```
+
+Convenience macro for runtime hashing. When `SYSCALLS_NO_HASH` is defined, returns the string as-is. Otherwise, computes the hash at runtime.
+
+**Parameters:**
+- `str` - String to hash
+
+**Returns:** Either `Hash_t` (default) or `const char*` (if `SYSCALLS_NO_HASH` defined)
+
+**Usage:**
+```cpp
+auto key = SYSCALL_ID_RT(dynamicString.c_str());
+```
+
+## Compile Flags
+
+### SYSCALLS_NO_HASH
+
+Define this macro to disable hashing and use string names directly. This is useful for debugging.
+
+```cpp
+#define SYSCALLS_NO_HASH
+```
+
+When defined:
+- `SYSCALL_ID(str)` returns `str`
+- `SYSCALL_ID_RT(str)` returns `str`
+- `SyscallKey_t` becomes `std::string` instead of `Hash_t`
+
+## Algorithm Details
+
+The hashing algorithm uses:
+- Custom polynomial keys derived from compile-time seed
+- XOR operations for mixing
+- Bit rotation (`std::rotr`) for avalanche effect
+- Different rotation amounts for each key
+
+The algorithm is designed to:
+- Produce uniform distribution of hash values
+- Be fast at both compile-time and runtime
+- Generate unique hashes per compilation
+- Resist simple pattern analysis
+
+## Example
+
+```cpp
+// Compile-time hashing
+constexpr auto ntdllHash = syscall::hashing::calculateHash("ntdll.dll");
+constexpr auto funcHash = SYSCALL_ID("NtAllocateVirtualMemory");
+
+// Runtime hashing
+std::string moduleName = getModuleName();
+auto moduleHash = syscall::hashing::calculateHashRuntime(moduleName);
+
+// String view hashing
+std::string_view sv = "NtQuerySystemInformation";
+auto svHash = syscall::hashing::calculateHashRuntime(sv);
+```
+
+## Related
+
+- [Type Aliases](/api/utilities/type-aliases) - `SyscallKey_t` definition
+- [Native API](/api/utilities/native-api) - Uses hashing for module/export lookup

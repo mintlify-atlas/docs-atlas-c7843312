@@ -1,0 +1,392 @@
+---
+title: "Native API"
+description: "Low-level Windows API utilities for module and export resolution"
+---
+
+## Overview
+
+The `syscall::native` namespace provides low-level Windows API utilities for:
+- Retrieving module base addresses from PEB
+- Resolving exported function addresses
+- Accessing process environment structures
+- Native Windows type definitions
+
+## Namespace
+
+```cpp
+namespace syscall::native
+```
+
+## Process Information
+
+### getCurrentProcess
+
+```cpp
+constexpr HANDLE getCurrentProcess() noexcept;
+```
+
+Returns a pseudo-handle to the current process.
+
+**Returns:** `HANDLE` with value `-1` (pseudo-handle for current process)
+
+**Note:** This is a constexpr wrapper around the Windows pseudo-handle convention.
+
+### getCurrentPEB
+
+```cpp
+inline PPEB getCurrentPEB();
+```
+
+Retrieves the Process Environment Block (PEB) for the current process.
+
+**Returns:** Pointer to the current process's PEB structure
+
+**Platform-specific:**
+- **x64:** Reads from `gs:[0x60]`
+- **x86:** Reads from `fs:[0x30]`
+
+**Usage:**
+```cpp
+auto pPeb = syscall::native::getCurrentPEB();
+if (pPeb && pPeb->Ldr) {
+    // Access loader data
+}
+```
+
+## Module Resolution
+
+### getModuleBase (by name)
+
+```cpp
+inline HMODULE getModuleBase(const wchar_t* wzModuleName);
+```
+
+Retrieves the base address of a loaded module by name.
+
+**Parameters:**
+- `wzModuleName` - Wide-character module name (e.g., `L"ntdll.dll"`)
+
+**Returns:** Module base address (`HMODULE`) or `nullptr` if not found
+
+**Implementation:**
+- Walks the PEB's InMemoryOrderModuleList
+- Performs case-insensitive string comparison
+- Returns first matching module
+
+**Usage:**
+```cpp
+HMODULE hNtdll = syscall::native::getModuleBase(L"ntdll.dll");
+```
+
+### getModuleBase (by hash)
+
+```cpp
+inline HMODULE getModuleBase(hashing::Hash_t uModuleHash);
+```
+
+Retrieves the base address of a loaded module by hash.
+
+**Parameters:**
+- `uModuleHash` - Hash of the module name
+
+**Returns:** Module base address (`HMODULE`) or `nullptr` if not found
+
+**Implementation:**
+- Walks the PEB's InMemoryOrderModuleList
+- Computes case-insensitive hash of each module name
+- Returns first matching module
+
+**Usage:**
+```cpp
+auto hash = syscall::hashing::calculateHash("ntdll.dll");
+HMODULE hNtdll = syscall::native::getModuleBase(hash);
+```
+
+## Export Resolution
+
+### getExportAddress (by name)
+
+```cpp
+inline void* getExportAddress(HMODULE hModuleBase, const char* szExportName);
+```
+
+Resolves an exported function address by name.
+
+**Parameters:**
+- `hModuleBase` - Module base address
+- `szExportName` - Name of the exported function
+
+**Returns:** Function address or `nullptr` if not found
+
+**Features:**
+- Parses PE export directory
+- Handles forwarded exports automatically
+- Recursively resolves forwarder chains
+
+**Usage:**
+```cpp
+HMODULE hNtdll = syscall::native::getModuleBase(L"ntdll.dll");
+auto pFunc = syscall::native::getExportAddress(hNtdll, "NtAllocateVirtualMemory");
+```
+
+### getExportAddress (by hash)
+
+```cpp
+inline void* getExportAddress(HMODULE hModuleBase, hashing::Hash_t uExportHash);
+```
+
+Resolves an exported function address by hash.
+
+**Parameters:**
+- `hModuleBase` - Module base address
+- `uExportHash` - Hash of the exported function name
+
+**Returns:** Function address or `nullptr` if not found
+
+**Features:**
+- Parses PE export directory
+- Computes runtime hash for each export
+- Handles forwarded exports automatically
+- Recursively resolves forwarder chains
+
+**Usage:**
+```cpp
+HMODULE hNtdll = syscall::native::getModuleBase(L"ntdll.dll");
+auto hash = SYSCALL_ID("NtAllocateVirtualMemory");
+auto pFunc = syscall::native::getExportAddress(hNtdll, hash);
+```
+
+## Hashing Utilities
+
+### calculateHashRuntimeCi (wchar_t)
+
+```cpp
+inline hashing::Hash_t calculateHashRuntimeCi(const wchar_t* wzData);
+```
+
+Computes a case-insensitive runtime hash for wide-character strings.
+
+**Parameters:**
+- `wzData` - Wide-character string to hash
+
+**Returns:** 64-bit hash value
+
+**Note:** Converts each character to lowercase ANSI before hashing.
+
+### calculateHashRuntimeCi (char)
+
+```cpp
+inline hashing::Hash_t calculateHashRuntimeCi(const char* szData);
+```
+
+Computes a case-insensitive runtime hash for narrow-character strings.
+
+**Parameters:**
+- `szData` - Narrow-character string to hash
+
+**Returns:** 64-bit hash value
+
+**Note:** Converts each character to lowercase before hashing.
+
+## Performance Utilities
+
+### rdtscp
+
+```cpp
+SYSCALL_FORCE_INLINE uint64_t rdtscp();
+```
+
+Reads the Time Stamp Counter and Processor ID.
+
+**Returns:** 64-bit timestamp counter value
+
+**Platform Support:**
+- **MSVC:** Uses `__rdtscp` intrinsic
+- **GCC/Clang:** Uses `__builtin_ia32_rdtscp` intrinsic
+
+**Usage:**
+```cpp
+// Generate random index based on TSC
+size_t randomIndex = syscall::native::rdtscp() % count;
+```
+
+## Type Definitions
+
+### LDR_DATA_TABLE_ENTRY
+
+```cpp
+struct LDR_DATA_TABLE_ENTRY
+{
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    ULONG Flags;
+    USHORT LoadCount;
+    USHORT TlsIndex;
+    // ... additional fields
+};
+```
+
+Structure representing a loaded module in the PEB's loader data.
+
+### Native Function Types
+
+```cpp
+// Section management
+using NtCreateSection_t = NTSTATUS(NTAPI*)(
+    PHANDLE SectionHandle, ACCESS_MASK DesiredAccess, 
+    POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize, 
+    ULONG SectionPageProtection, ULONG AllocationAttributes, 
+    HANDLE FileHandle
+);
+
+using NtMapViewOfSection_t = NTSTATUS(NTAPI*)(
+    HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress,
+    ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset,
+    PSIZE_T ViewSize, ESectionInherit InheritDisposition, 
+    ULONG AllocationType, ULONG Win32Protect
+);
+
+using NtUnmapViewOfSection_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID BaseAddress
+);
+
+// Memory management
+using NtAllocateVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect
+);
+
+using NtProtectVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize,
+    ULONG NewProtect, PULONG OldProtect
+);
+
+using NtFreeVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize, 
+    ULONG FreeType
+);
+
+// Heap management
+using RtlCreateHeap_t = PVOID(NTAPI*)(
+    ULONG Flags, PVOID HeapBase, SIZE_T ReserveSize, 
+    SIZE_T CommitSize, PVOID Lock, PVOID Parameters
+);
+
+using RtlAllocateHeap_t = PVOID(NTAPI*)(
+    PVOID HeapHandle, ULONG Flags, SIZE_T Size
+);
+
+using RtlDestroyHeap_t = PVOID(NTAPI*)(
+    PVOID HeapHandle
+);
+
+// Handle management
+using NtClose_t = NTSTATUS(NTAPI*)(
+    HANDLE Handle
+);
+```
+
+### Enumerations
+
+#### ESectionInherit
+
+```cpp
+enum class ESectionInherit : DWORD 
+{
+    VIEW_SHARE = 1,
+    VIEW_UNMAP = 2
+};
+```
+
+Section inheritance options for mapped views.
+
+#### ESectionAllocAttributes
+
+```cpp
+enum class ESectionAllocAttributes : ULONG 
+{
+    SECTION_COMMIT = SEC_COMMIT,
+    SECTION_IMAGE = SEC_IMAGE,
+    SECTION_IMAGE_NO_EXECUTE = SEC_IMAGE_NO_EXECUTE,
+    SECTION_LARGE_PAGES = SEC_LARGE_PAGES,
+    SECTION_NO_CHANGE = 0x00400000,
+    SECTION_RESERVE = SEC_RESERVE,
+};
+```
+
+Section allocation attributes.
+
+### Status Codes
+
+```cpp
+constexpr NTSTATUS STATUS_SUCCESS = 0x00000000L;
+constexpr NTSTATUS STATUS_UNSUCCESSFUL = 0xC0000001L;
+constexpr NTSTATUS STATUS_PROCEDURE_NOT_FOUND = 0xC000007A;
+```
+
+### Helper Functions
+
+#### isSuccess
+
+```cpp
+constexpr bool isSuccess(NTSTATUS status) noexcept;
+```
+
+Checks if an NTSTATUS value indicates success.
+
+**Parameters:**
+- `status` - NTSTATUS value to check
+
+**Returns:** `true` if status >= 0, `false` otherwise
+
+## Implementation Notes
+
+### Export Forwarding
+
+Both `getExportAddress` functions handle forwarded exports:
+1. Detect forwarded exports by checking if RVA points inside export section
+2. Parse forwarder string (format: `"DLL.Function"`)
+3. Recursively resolve the target module and function
+4. Support both name-based and hash-based resolution in forwarder chain
+
+### PE Format
+
+The implementation directly parses PE structures:
+- DOS header validation (`IMAGE_DOS_SIGNATURE`)
+- NT headers validation (`IMAGE_NT_SIGNATURE`)
+- Export directory traversal
+- Name/ordinal resolution
+
+## Example
+
+```cpp
+// Get ntdll.dll base address
+auto hNtdll = syscall::native::getModuleBase(
+    syscall::hashing::calculateHash("ntdll.dll")
+);
+
+if (hNtdll) {
+    // Resolve NtAllocateVirtualMemory
+    auto pNtAllocate = syscall::native::getExportAddress(
+        hNtdll, 
+        SYSCALL_ID("NtAllocateVirtualMemory")
+    );
+    
+    if (pNtAllocate) {
+        auto fNtAllocate = reinterpret_cast<NtAllocateVirtualMemory_t>(pNtAllocate);
+        // Use the function
+    }
+}
+```
+
+## Related
+
+- [Hashing](/api/utilities/hashing) - Hash calculation functions
+- [Type Aliases](/api/utilities/type-aliases) - `ModuleInfo_t` structure
+- [Manager](/api/core/manager) - Uses these utilities for initialization

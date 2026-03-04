@@ -1,0 +1,154 @@
+---
+title: "Direct Syscalls"
+description: "Learn how to use the direct syscall generator for straightforward system call invocation"
+---
+
+## Overview
+
+The `generator::direct` policy generates inline syscall stubs that execute system calls directly without using `syscall; ret` gadgets or exception handlers. This is the most straightforward approach and works on both x64 and x86 platforms.
+
+## How It Works
+
+The direct generator creates a small assembly stub for each syscall that:
+
+1. Moves the first argument from `rcx` to `r10` (x64 calling convention)
+2. Loads the syscall number into `eax`
+3. Executes the `syscall` instruction
+4. Returns to the caller
+
+### Generated Shellcode (x64)
+
+```asm
+push rcx                    ; Save rcx
+pop r10                     ; Move to r10 (syscall convention)
+mov eax, <syscall_number>   ; Load syscall number
+syscall                     ; Execute system call
+add rsp, 8                  ; Clean up stack
+jmp qword ptr [rsp-8]       ; Return to caller
+```
+
+The stub is 18 bytes on x64 and 15 bytes on x86.
+
+## Complete Example
+
+Here's a complete example from `examples/basic-usage.cpp` that allocates virtual memory using direct syscalls:
+
+```cpp
+#include <iostream>
+#include <syscalls-cpp/syscall.hpp>
+
+int main() 
+{
+    // Create syscall manager with section allocator and direct generator
+    syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::direct
+    > syscallManager;
+    
+    // Initialize the manager (parses ntdll.dll for syscall numbers)
+    if (!syscallManager.initialize())
+    {
+        std::cerr << "initialization failed!\n";
+        return 1;
+    }
+
+    // Allocate virtual memory
+    PVOID pBaseAddress = nullptr;
+    SIZE_T uSize = 0x1000;
+
+    NTSTATUS status = syscallManager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        syscall::native::getCurrentProcess(),
+        &pBaseAddress,
+        0, &uSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+
+    if (pBaseAddress)
+        std::cout << "allocation successful at 0x" << pBaseAddress << std::endl;
+
+    return 0;
+}
+```
+
+## Key Components
+
+### Allocator Policy
+
+The example uses `allocator::section` which creates executable memory using `NtCreateSection` and maps it with execute permissions. Other options include:
+
+- `allocator::heap` - Uses RtlCreateHeap with HEAP_CREATE_ENABLE_EXECUTE
+- `allocator::memory` - Uses NtAllocateVirtualMemory directly
+
+### Generator Policy
+
+The `generator::direct` policy has these characteristics:
+
+- **bRequiresGadget**: `false` - No need to search for gadgets
+- **getStubSize()**: Returns 18 bytes (x64) or 15 bytes (x86)
+- **generate()**: Copies the shellcode template and patches in the syscall number
+
+### Syscall Invocation
+
+The `SYSCALL_ID` macro computes a compile-time hash of the function name:
+
+```cpp
+SYSCALL_ID("NtAllocateVirtualMemory")
+```
+
+This enables hash-based function resolution without storing strings.
+
+## Benefits
+
+<AccordionGroup>
+  <Accordion title="Performance">
+    Direct syscalls have minimal overhead - just the syscall instruction itself with no indirection through gadgets or exception handlers.
+  </Accordion>
+
+  <Accordion title="Simplicity">
+    The implementation is straightforward and easy to understand. No complex gadget searching or exception handling setup.
+  </Accordion>
+
+  <Accordion title="Cross-Platform">
+    Works on both x64 and x86 Windows platforms with appropriate shellcode for each architecture.
+  </Accordion>
+
+  <Accordion title="Reliability">
+    No dependencies on finding specific byte patterns in ntdll.dll or setting up exception handlers.
+  </Accordion>
+</AccordionGroup>
+
+## Use Cases
+
+- **General Purpose**: Best default choice for most applications
+- **Performance Critical**: When you need the fastest syscall execution
+- **Simple Projects**: When you don't need advanced evasion techniques
+- **Legacy Support**: Works on both modern and older Windows versions
+
+## Limitations
+
+<Warning>
+The syscall instruction is executed directly from your code, which means:
+
+- EDR/AV solutions can detect syscalls originating from non-ntdll memory
+- Stack traces will show syscalls coming from your allocated stubs
+- Less stealthy than gadget-based approaches for security research
+</Warning>
+
+## Expected Behavior
+
+When you run the example:
+
+```bash
+$ ./basic-usage.exe
+allocation successful at 0x000001A2B3C4D000
+```
+
+The program successfully allocates 4KB of virtual memory and prints the base address.
+
+## See Also
+
+- [Gadget Syscalls](/examples/gadget-syscalls) - Using syscall; ret gadgets
+- [Exception Syscalls](/examples/exception-syscalls) - VEH-based approach
+- [Custom Generators](/examples/custom-generators) - Build your own generator

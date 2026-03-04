@@ -1,0 +1,357 @@
+---
+title: "Type Aliases"
+description: "Core type definitions and pre-defined Manager configurations"
+---
+
+## Overview
+
+This page documents the core type aliases, structures, and pre-defined Manager type aliases used throughout the syscalls-cpp library.
+
+## Namespace
+
+```cpp
+namespace syscall
+```
+
+## Core Type Aliases
+
+### SyscallKey_t
+
+```cpp
+#ifdef SYSCALLS_NO_HASH
+    using SyscallKey_t = std::string;
+#else
+    using SyscallKey_t = hashing::Hash_t;
+#endif
+```
+
+The key type used to identify syscalls throughout the library.
+
+**Behavior:**
+- **Default:** `hashing::Hash_t` (uint64_t) - Uses hashed syscall names
+- **With `SYSCALLS_NO_HASH`:** `std::string` - Uses plain string names
+
+**Usage:**
+```cpp
+// Default mode (hashing enabled)
+SyscallKey_t key = SYSCALL_ID("NtAllocateVirtualMemory");
+
+// Debug mode (SYSCALLS_NO_HASH defined)
+SyscallKey_t key = "NtAllocateVirtualMemory";
+```
+
+## Structure Definitions
+
+### SyscallEntry_t
+
+```cpp
+struct SyscallEntry_t
+{
+    SyscallKey_t m_key;
+    uint32_t m_uSyscallNumber;
+    uint32_t m_uOffset;
+};
+```
+
+Represents a single syscall entry in the manager's lookup table.
+
+**Members:**
+- `m_key` - Syscall identifier (hash or string depending on `SYSCALLS_NO_HASH`)
+- `m_uSyscallNumber` - Windows syscall number for this function
+- `m_uOffset` - Offset of the generated stub in the allocated region
+
+**Usage:**
+```cpp
+SyscallEntry_t entry{
+    .m_key = SYSCALL_ID("NtAllocateVirtualMemory"),
+    .m_uSyscallNumber = 0x18,
+    .m_uOffset = 0
+};
+```
+
+### ModuleInfo_t
+
+```cpp
+struct ModuleInfo_t
+{
+    uint8_t* m_pModuleBase = nullptr;
+    IMAGE_NT_HEADERS* m_pNtHeaders = nullptr;
+    IMAGE_EXPORT_DIRECTORY* m_pExportDir = nullptr;
+};
+```
+
+Contains parsed PE information for a loaded module.
+
+**Members:**
+- `m_pModuleBase` - Base address of the module in memory
+- `m_pNtHeaders` - Pointer to the PE NT headers
+- `m_pExportDir` - Pointer to the export directory
+
+**Usage:**
+```cpp
+ModuleInfo_t info;
+if (getModuleInfo(SYSCALL_ID("ntdll.dll"), info)) {
+    // Access NT headers and export directory
+}
+```
+
+## Policy Type Traits
+
+### IsIAllocationPolicy
+
+```cpp
+template<typename T>
+concept IsIAllocationPolicy = requires(size_t uSize, const std::span<const uint8_t>vecBuffer, void*& pRegion, HANDLE & hObject)
+{
+    { T::allocate(uSize, vecBuffer, pRegion, hObject) } -> std::convertible_to<bool>;
+    { T::release(pRegion, hObject) } -> std::same_as<void>;
+};
+```
+
+Concept defining the requirements for allocation policy types.
+
+**Requirements:**
+- `static bool allocate(size_t, const std::span<const uint8_t>, void*&, HANDLE&)`
+- `static void release(void*, HANDLE)`
+
+### IsStubGenerationPolicy
+
+```cpp
+template<typename T>
+concept IsStubGenerationPolicy = requires(uint8_t * pBuffer, uint32_t uSyscallNumber, void* pGadget)
+{
+    { T::bRequiresGadget } -> std::same_as<const bool&>;
+    { T::getStubSize() } -> std::convertible_to<size_t>;
+    { T::generate(pBuffer, uSyscallNumber, pGadget) } -> std::same_as<void>;
+};
+```
+
+Concept defining the requirements for stub generation policy types.
+
+**Requirements:**
+- `static constexpr bool bRequiresGadget`
+- `static constexpr size_t getStubSize()`
+- `static void generate(uint8_t*, uint32_t, void*)`
+
+### IsSyscallParsingPolicy
+
+```cpp
+template<typename T>
+concept IsSyscallParsingPolicy = requires(const ModuleInfo_t & module)
+{
+    { T::parse(module) } -> std::convertible_to<std::vector<SyscallEntry_t>>;
+};
+```
+
+Concept defining the requirements for syscall parsing policy types.
+
+**Requirements:**
+- `static std::vector<SyscallEntry_t> parse(const ModuleInfo_t&)`
+
+### ParserChain_t
+
+```cpp
+template<IsSyscallParsingPolicy... IParsers>
+struct ParserChain_t
+{
+    static_assert(sizeof...(IParsers) > 0, "Parsedchain_t cannot be empty.");
+};
+```
+
+Type wrapper for parser policy chains. Used to group multiple parsing strategies with fallback behavior.
+
+**Usage:**
+```cpp
+using MyParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,
+    syscall::policies::parser::signature
+>;
+```
+
+## Pre-defined Manager Types
+
+The library provides convenient type aliases for common Manager configurations:
+
+### SyscallSectionDirect
+
+```cpp
+using SyscallSectionDirect = syscall::Manager<
+    syscall::policies::allocator::section, 
+    syscall::policies::generator::direct
+>;
+```
+
+Direct syscall execution with section-backed memory allocation.
+
+**Characteristics:**
+- Uses `NtCreateSection`/`NtMapViewOfSection` for memory allocation
+- Direct syscall execution without gadgets
+- Compatible with both x86 and x64
+- Lower overhead than gadget-based approaches
+
+**Use Cases:**
+- General purpose syscall execution
+- When gadget discovery is not required
+- Performance-sensitive scenarios
+
+### SyscallSectionGadget (x64 only)
+
+```cpp
+#if SYSCALL_PLATFORM_WINDOWS_64
+using SyscallSectionGadget = syscall::Manager<
+    syscall::policies::allocator::section, 
+    syscall::policies::generator::gadget
+>;
+#endif
+```
+
+Gadget-based syscall execution with section-backed memory allocation.
+
+**Characteristics:**
+- Uses `NtCreateSection`/`NtMapViewOfSection` for memory allocation
+- Gadget-based syscall execution (finds `syscall; ret` in ntdll)
+- Randomized gadget selection for each stub
+- x64 only
+
+**Use Cases:**
+- Advanced evasion scenarios
+- When direct syscalls might be detected
+- Call stack spoofing requirements
+
+### SyscallHeapGadget (x64 only)
+
+```cpp
+#if SYSCALL_PLATFORM_WINDOWS_64
+using SyscallHeapGadget = syscall::Manager<
+    syscall::policies::allocator::heap, 
+    syscall::policies::generator::gadget
+>;
+#endif
+```
+
+Gadget-based syscall execution with private heap allocation.
+
+**Characteristics:**
+- Uses `RtlCreateHeap`/`RtlAllocateHeap` for memory allocation
+- Gadget-based syscall execution
+- Stubs stored in private executable heap
+- x64 only
+
+**Use Cases:**
+- When section-based allocation is monitored
+- Alternative memory allocation strategy
+- Heap-based code execution scenarios
+
+## Default Parser Chain
+
+```cpp
+using DefaultParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,
+    syscall::policies::parser::signature
+>;
+```
+
+The default parser chain used when no explicit parsers are specified.
+
+**Behavior:**
+1. First tries `directory` parser (exception directory on x64, export sorting on x86)
+2. Falls back to `signature` parser if directory parsing fails
+3. Handles hooked functions by searching neighboring functions
+
+## Usage Examples
+
+### Using Pre-defined Types
+
+```cpp
+// Direct syscalls with section allocation
+SyscallSectionDirect manager;
+if (manager.initialize()) {
+    auto status = manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        // ... arguments
+    );
+}
+
+#if SYSCALL_PLATFORM_WINDOWS_64
+// Gadget-based syscalls with section allocation
+SyscallSectionGadget manager;
+if (manager.initialize()) {
+    auto status = manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtQuerySystemInformation"),
+        // ... arguments
+    );
+}
+#endif
+```
+
+### Custom Manager Configuration
+
+```cpp
+// Custom manager with memory allocation and exception-based stubs
+using CustomManager = syscall::Manager<
+    syscall::policies::allocator::memory,
+    syscall::policies::generator::exception,
+    syscall::policies::parser::signature
+>;
+
+CustomManager manager;
+manager.initialize();
+```
+
+### Working with SyscallEntry_t
+
+```cpp
+std::vector<SyscallEntry_t> entries = {
+    { SYSCALL_ID("NtAllocateVirtualMemory"), 0x18, 0 },
+    { SYSCALL_ID("NtProtectVirtualMemory"), 0x50, 32 },
+    { SYSCALL_ID("NtFreeVirtualMemory"), 0x1E, 64 }
+};
+
+// Sort by key for binary search
+std::ranges::sort(entries, std::less{}, &SyscallEntry_t::m_key);
+```
+
+## Type Selection Guide
+
+<CardGroup cols={2}>
+  <Card title="SyscallSectionDirect" icon="bolt">
+    Best for general purpose use. Direct execution with minimal overhead.
+  </Card>
+  
+  <Card title="SyscallSectionGadget" icon="mask">
+    Best for evasion. Indirect execution through gadgets hides call origin.
+  </Card>
+  
+  <Card title="SyscallHeapGadget" icon="database">
+    Best for alternative allocation. Uses heap instead of sections.
+  </Card>
+  
+  <Card title="Custom Manager" icon="wrench">
+    Best for specialized needs. Mix and match policies as needed.
+  </Card>
+</CardGroup>
+
+## Compile-Time Configuration
+
+### SYSCALLS_NO_HASH
+
+When defined, changes `SyscallKey_t` from hash-based to string-based lookups.
+
+**Impact:**
+- Easier debugging (can see syscall names)
+- Larger binary size (stores full strings)
+- Less obfuscation (names visible in binary)
+- No compile-time seed variation
+
+```cpp
+// Debug build
+#define SYSCALLS_NO_HASH
+
+SyscallKey_t key = "NtAllocateVirtualMemory"; // std::string
+```
+
+## Related
+
+- [Manager](/api/core/manager) - Uses these types
+- [Policies](/api/policies/overview) - Policy implementations
+- [Hashing](/api/utilities/hashing) - Hash_t definition

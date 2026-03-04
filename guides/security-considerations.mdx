@@ -1,0 +1,639 @@
+---
+title: Security Considerations
+description: Critical security warnings, best practices, and threat model considerations for syscalls-cpp
+---
+
+## Overview
+
+Using direct syscalls comes with significant security implications. This guide covers critical vulnerabilities to avoid, operational security best practices, and threat model considerations when choosing policies.
+
+<Warning>
+This library is designed for legitimate security research, red team operations, and software protection. Ensure you have proper authorization before using these techniques.
+</Warning>
+
+## Critical: NULL vs nullptr on x64
+
+This is the most common and dangerous mistake when using syscalls-cpp on x64 platforms.
+
+### The Problem
+
+The `NULL` macro is typically defined as integer `0`, which is a 32-bit value. On x64, pointers are 64-bit. When you pass `NULL` to a syscall expecting a 64-bit pointer, the compiler may:
+
+1. Push only 32 bits onto the stack
+2. Fail to properly zero-extend to 64 bits
+3. Cause argument misalignment for all subsequent parameters
+4. Result in stack corruption and unpredictable crashes
+
+### Example of the Bug
+
+```cpp
+// WRONG - Will cause stack corruption on x64!
+PVOID pBaseAddress = NULL;  // NULL = (int)0
+SIZE_T uSize = 0x1000;
+
+NTSTATUS status = syscallManager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    syscall::native::getCurrentProcess(),
+    &pBaseAddress,
+    NULL,  // ⚠️ BUG: Passing 32-bit 0 for 64-bit parameter
+    &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+### The Solution
+
+**Always use `nullptr` on x64:**
+
+```cpp
+// CORRECT - nullptr is type-safe and 64-bit
+PVOID pBaseAddress = nullptr;  // nullptr is properly typed
+SIZE_T uSize = 0x1000;
+
+NTSTATUS status = syscallManager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    syscall::native::getCurrentProcess(),
+    &pBaseAddress,
+    nullptr,  // ✅ Correct: 64-bit null pointer
+    &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+*Source: readme.md:129-136*
+
+### Why This Matters
+
+<CardGroup cols={2}>
+  <Card title="Stack Corruption" icon="bomb">
+    Misaligned arguments corrupt the stack, causing crashes that are extremely difficult to debug.
+  </Card>
+  
+  <Card title="Unpredictable Behavior" icon="triangle-exclamation">
+    The syscall may read garbage values from the stack, leading to memory corruption or security vulnerabilities.
+  </Card>
+  
+  <Card title="Hard to Debug" icon="magnifying-glass">
+    The crash often occurs far from the actual bug, making it hard to identify the root cause.
+  </Card>
+  
+  <Card title="Platform-Specific" icon="microchip">
+    Works fine on x86 (where NULL is acceptable), fails mysteriously on x64.
+  </Card>
+</CardGroup>
+
+<Tip>
+Enable compiler warnings like `/W4` (MSVC) or `-Wall -Wextra` (GCC/Clang) to catch potential NULL/nullptr issues.
+</Tip>
+
+## Allocation Strategy Trade-offs
+
+Each allocation policy has different security properties. Choose based on your threat model.
+
+### allocator::section - Maximum Protection
+
+```cpp
+syscall::Manager<syscall::policies::allocator::section, 
+                 /* generator policy */> manager;
+```
+
+**Security Properties:**
+- Uses `SEC_NO_CHANGE` flag to make memory immutable
+- **Cannot be modified** even by the allocating process
+- Resistant to in-memory patching and hook injection
+- Visible to kernel-mode inspection
+
+**When to Use:**
+- When protecting against usermode hooking/patching
+- When you need immutable code regions
+- Defense against tampering
+
+**Trade-offs:**
+- More complex allocation process
+- Slightly higher initialization overhead
+- Memory cannot be modified after creation
+
+*Source: include/syscalls-cpp/syscall.hpp:115-165*
+
+### allocator::heap - Private Executable Heap
+
+```cpp
+syscall::Manager<syscall::policies::allocator::heap, 
+                 /* generator policy */> manager;
+```
+
+**Security Properties:**
+- Private heap with `HEAP_CREATE_ENABLE_EXECUTE`
+- Memory can be deallocated without freeing entire region
+- Less common allocation pattern (harder to detect)
+- Heap metadata may leak information
+
+**When to Use:**
+- When you need to allocate/free stubs dynamically
+- When hiding allocation patterns from monitoring tools
+- When heap-based allocations are more expected
+
+**Trade-offs:**
+- Heap metadata exists (potential information leak)
+- Can be modified (vulnerable to patching)
+- Requires heap management overhead
+
+*Source: include/syscalls-cpp/syscall.hpp:167-209*
+
+### allocator::memory - Standard Virtual Memory
+
+```cpp
+syscall::Manager<syscall::policies::allocator::memory, 
+                 /* generator policy */> manager;
+```
+
+**Security Properties:**
+- Standard `NtAllocateVirtualMemory` allocation
+- Transitions from RW to RX (W^X principle)
+- Most common allocation pattern
+- Easily monitored by security products
+
+**When to Use:**
+- When you need standard memory allocation
+- When you want predictable behavior
+- For testing and development
+
+**Trade-offs:**
+- Most easily detected allocation pattern
+- Can be modified if protection changes
+- Standard technique, well-known to defenders
+
+*Source: include/syscalls-cpp/syscall.hpp:211-259*
+
+### Comparison Matrix
+
+| Property | section | heap | memory |
+|----------|---------|------|--------|
+| **Tamper Resistance** | Excellent | Poor | Poor |
+| **Stealth** | Medium | High | Low |
+| **Performance** | Medium | High | High |
+| **Complexity** | High | Medium | Low |
+| **Modifiable** | No | Yes | Yes |
+| **Detection Risk** | Medium | Low | High |
+
+## Stub Generation Strategy Trade-offs
+
+Different stub generation approaches have varying detection risks and complexity.
+
+### generator::direct - Self-Contained Syscall
+
+```cpp
+syscall::Manager</* allocator policy */, 
+                 syscall::policies::generator::direct> manager;
+```
+
+**Security Properties:**
+- Direct `syscall` instruction in allocated memory
+- Self-contained, no external dependencies
+- Easily detected by signature scanning
+- Fastest execution
+
+**Detection Risks:**
+- Static signature: `0F 05` (syscall instruction)
+- Memory scanning will find syscall instructions
+- Pattern is well-known to EDR products
+
+**When to Use:**
+- When performance is critical
+- When detection is not a concern
+- For development and testing
+
+*Source: include/syscalls-cpp/syscall.hpp:309-341*
+
+### generator::gadget - Indirect Syscall (x64 only)
+
+```cpp
+syscall::Manager</* allocator policy */, 
+                 syscall::policies::generator::gadget> manager;
+```
+
+**Security Properties:**
+- No `syscall` instruction in allocated memory
+- Jumps to legitimate `syscall; ret` gadget in ntdll
+- Harder to detect via memory scanning
+- Syscall originates from trusted module
+
+**Detection Risks:**
+- Unusual control flow (jump to gadget)
+- Stack analysis may reveal indirect call
+- Return address points outside normal call chain
+
+**When to Use:**
+- When avoiding syscall instructions in your memory
+- When you want syscalls to appear from ntdll
+- Against signature-based detection
+
+*Source: include/syscalls-cpp/syscall.hpp:264-292*
+
+### generator::exception - VEH-Based Syscall
+
+```cpp
+syscall::Manager</* allocator policy */, 
+                 syscall::policies::generator::exception> manager;
+```
+
+**Security Properties:**
+- Uses `ud2` (illegal instruction) exception
+- Actual syscall performed in exception handler
+- No syscall instruction in stub code
+- Most complex control flow
+
+**Detection Risks:**
+- VEH registration is monitored by many EDR products
+- Unusual exception-based control flow
+- Performance overhead from exception handling
+- Exception-based execution is suspicious
+
+**When to Use:**
+- For advanced evasion techniques
+- When you need maximum obfuscation
+- In research and experimentation
+
+**Trade-offs:**
+- Significant performance overhead
+- Complex debugging
+- VEH registration may trigger alerts
+
+*Source: include/syscalls-cpp/syscall.hpp:296-307*
+
+### Comparison Matrix
+
+| Property | direct | gadget | exception |
+|----------|--------|--------|----------|
+| **Performance** | Excellent | Good | Poor |
+| **Stealth** | Low | High | Medium |
+| **Complexity** | Low | Medium | High |
+| **x86 Support** | Yes | No | Yes |
+| **Detection Risk** | High | Low | Medium |
+| **Debugging** | Easy | Medium | Hard |
+
+## Parsing Strategy Considerations
+
+### parser::directory - Exception/Export Directory
+
+**Security Properties:**
+- Uses PE metadata (exception directory on x64)
+- Resilient to hooks (reads structure, not code)
+- Accurate on unpatched systems
+- Fast parsing
+
+**When to Use:**
+- On unhooked systems
+- When you trust PE metadata
+- For maximum performance
+
+**Limitations:**
+- May fail if PE structure is modified
+- Doesn't detect hooks
+
+*Source: include/syscalls-cpp/syscall.hpp:346-453*
+
+### parser::signature - Prologue Scanning with Hook Detection
+
+**Security Properties:**
+- Scans actual function code
+- **Detects hooks** via signature mismatch
+- **Searches neighboring functions** if hook detected
+- Resilient to simple hooks
+
+**When to Use:**
+- On systems with usermode hooks (EDR)
+- As a fallback parser
+- When you need hook detection
+
+**How Hook Detection Works:**
+
+If a function is hooked (doesn't start with expected bytes), the parser searches neighboring syscalls:
+
+```cpp
+if (isFunctionHooked(pFunctionStart) && !bSyscallFound)
+{
+    // Search up to 20 functions above
+    for (int j = 1; j < 20; ++j)
+    {
+        uint8_t* pNeighborFunc = pFunctionStart - (j * 0x20);
+        if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+        {
+            uint32_t uNeighborSyscall = 
+                *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+            uSyscallNumber = uNeighborSyscall + j;  // Calculate offset
+            bSyscallFound = true;
+            break;
+        }
+    }
+}
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:504-520*
+
+**Detected Hook Patterns:**
+- `jmp` instructions (0xE9, 0xEB)
+- `jmp [mem]` (0xFF 0x25)
+- `int3` breakpoints (0xCC)
+- `ud2` (0x0F 0x0B)
+- Push/return trampolines
+
+*Source: include/syscalls-cpp/syscall.hpp:553-598*
+
+### Recommended Parser Chain
+
+Combine both for resilience:
+
+```cpp
+using ResilientChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,   // Try fast method first
+    syscall::policies::parser::signature    // Fallback with hook detection
+>;
+
+syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::gadget,
+    ResilientChain
+> manager;
+```
+
+## Operational Security Best Practices
+
+### 1. Avoid Suspicious Patterns
+
+<Warning>
+Combining certain techniques can create unique signatures that are easier to detect than individual techniques alone.
+</Warning>
+
+**Suspicious combinations:**
+- VEH registration + syscall allocation in short time window
+- Large number of small executable allocations
+- Executable heap creation immediately before sensitive operations
+
+### 2. Minimize Initialization Footprint
+
+Initialize once and reuse:
+
+```cpp
+// GOOD: Initialize once, reuse many times
+static syscall::Manager<...> g_syscallManager;
+
+void initialize()
+{
+    if (!g_syscallManager.initialize())
+    {
+        // Handle error
+    }
+}
+
+void performOperations()
+{
+    g_syscallManager.invoke<NTSTATUS>(...);
+    g_syscallManager.invoke<NTSTATUS>(...);
+    // ... many operations
+}
+```
+
+```cpp
+// BAD: Repeated initialization is suspicious
+void performOperation()
+{
+    syscall::Manager<...> manager;  // ⚠️ Creating multiple managers
+    manager.initialize();
+    manager.invoke<NTSTATUS>(...);
+}  // ⚠️ Destroyed, memory freed
+```
+
+### 3. Handle Initialization Failures Gracefully
+
+Don't make your intent obvious:
+
+```cpp
+// BAD: Obvious error message
+if (!syscallManager.initialize())
+{
+    std::cerr << "Failed to initialize direct syscalls!" << std::endl;
+    exit(1);
+}
+```
+
+```cpp
+// GOOD: Generic error handling
+if (!syscallManager.initialize())
+{
+    // Fall back to documented APIs or handle gracefully
+    return ERROR_INITIALIZATION_FAILED;
+}
+```
+
+### 4. Be Aware of Telemetry
+
+Modern Windows has extensive telemetry:
+
+<AccordionGroup>
+  <Accordion title="Event Tracing for Windows (ETW)">
+    ETW can log:
+    - Memory allocations with executable permissions
+    - VEH registration
+    - Syscall invocations (via kernel providers)
+    - Thread creation
+
+    **Mitigation:** Some techniques disable ETW providers (out of scope for this library).
+  </Accordion>
+
+  <Accordion title="Kernel-Mode Callbacks">
+    Kernel drivers can register callbacks for:
+    - Process/thread creation
+    - Image loading
+    - Object creation
+    - Memory allocation
+
+    **Mitigation:** None at user-mode level. Kernel-mode detection cannot be bypassed from usermode.
+  </Accordion>
+
+  <Accordion title="EDR/AV Scanning">
+    Security products actively scan:
+    - Memory for suspicious patterns
+    - Call stacks for anomalies
+    - Behavioral patterns
+    - API call sequences
+
+    **Mitigation:** Choose stealthier allocation and generation policies.
+  </Accordion>
+</AccordionGroup>
+
+### 5. Test Against Real Security Products
+
+Don't assume a technique works without testing:
+
+<Steps>
+  <Step title="Test in a Lab Environment">
+    Set up VMs with actual EDR/AV products installed. Never test on production systems without authorization.
+  </Step>
+  
+  <Step title="Monitor Telemetry">
+    Use tools like Sysmon and Process Monitor to see what telemetry your technique generates.
+  </Step>
+  
+  <Step title="Iterate and Improve">
+    If detected, analyze why and adjust your approach. Detection is a cat-and-mouse game.
+  </Step>
+</Steps>
+
+## Threat Model Considerations
+
+### Against Usermode Hooks
+
+**Threat:** EDR/AV products hook Win32 APIs and higher-level Nt* functions.
+
+**Defense:**
+- Use `parser::signature` with hook detection
+- Use `allocator::section` to prevent stub patching
+- Consider `generator::gadget` to avoid direct syscalls
+
+**Effectiveness:** High - bypasses most usermode hooks
+
+### Against Memory Scanning
+
+**Threat:** Security products scan process memory for suspicious patterns.
+
+**Defense:**
+- Avoid `generator::direct` (contains `0F 05` syscall signature)
+- Use `generator::gadget` or `generator::exception`
+- Consider custom generators with polymorphic code (see custom-generator.cpp example)
+
+**Effectiveness:** Medium - sophisticated scanners can still detect anomalies
+
+*Source: examples/custom-generator.cpp:59-239*
+
+### Against Behavioral Analysis
+
+**Threat:** EDR products analyze program behavior and call sequences.
+
+**Defense:**
+- Minimize suspicious behavior patterns
+- Mix syscalls with normal API calls
+- Avoid unusual timing or sequences
+
+**Effectiveness:** Low to Medium - behavioral analysis is very sophisticated
+
+### Against Kernel-Mode Inspection
+
+**Threat:** Kernel drivers inspect memory, threads, and syscalls from ring 0.
+
+**Defense:**
+- **None from usermode** - kernel can see everything
+- This library cannot bypass kernel-mode detection
+- Consider kernel-mode solutions if this is your threat model
+
+**Effectiveness:** None - kernel always wins against usermode
+
+## Recommended Configurations
+
+### For Maximum Stealth
+
+```cpp
+using StealthManager = syscall::Manager<
+    syscall::policies::allocator::heap,      // Less common allocation
+    syscall::policies::generator::gadget,    // No syscall instruction
+    syscall::ParserChain_t<
+        syscall::policies::parser::directory,
+        syscall::policies::parser::signature // Hook detection
+    >
+>;
+```
+
+### For Maximum Protection (Anti-Tampering)
+
+```cpp
+using ProtectedManager = syscall::Manager<
+    syscall::policies::allocator::section,   // SEC_NO_CHANGE immutability
+    syscall::policies::generator::direct,    // Simple and fast
+    syscall::policies::parser::directory     // Fast parsing
+>;
+```
+
+### For Development and Testing
+
+```cpp
+using DevManager = syscall::Manager<
+    syscall::policies::allocator::memory,    // Simple allocation
+    syscall::policies::generator::direct,    // Simple generation
+    syscall::policies::parser::signature    // Hook detection for testing
+>;
+```
+
+### For Research and Experimentation
+
+```cpp
+// Use the custom encrypted generator from examples
+using ResearchManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    EncryptedShellGenerator,  // Custom polymorphic generator
+    syscall::policies::parser::signature
+>;
+```
+
+*Source: examples/custom-generator.cpp:241-272*
+
+## Legal and Ethical Considerations
+
+<Warning>
+**Critical:** Using these techniques on systems you don't own or without explicit authorization is illegal in most jurisdictions.
+</Warning>
+
+### Legitimate Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Security Research" icon="flask">
+    Studying Windows internals and syscall mechanisms for educational purposes.
+  </Card>
+  
+  <Card title="Red Team Operations" icon="user-secret">
+    Authorized penetration testing with written permission from the system owner.
+  </Card>
+  
+  <Card title="Software Protection" icon="shield-halved">
+    Protecting your own software from tampering and reverse engineering.
+  </Card>
+  
+  <Card title="Malware Analysis" icon="microscope">
+    Understanding techniques used by malware to improve detection.
+  </Card>
+</CardGroup>
+
+### Illegal Use Cases
+
+- Unauthorized access to computer systems
+- Bypassing security on systems you don't own
+- Creating malware
+- Any use without explicit authorization
+
+## Summary
+
+<Note>
+Security is about trade-offs. Choose policies based on your specific threat model, performance requirements, and operational constraints.
+</Note>
+
+**Key Takeaways:**
+
+1. **Always use `nullptr`, never `NULL` on x64** - This prevents critical stack corruption bugs
+2. **Choose allocation policies** based on your need for tamper resistance vs. stealth
+3. **Choose generation policies** based on your need for performance vs. detection avoidance
+4. **Use parser chains** with both directory and signature parsers for resilience
+5. **Test against real security products** to validate your approach
+6. **Remember:** No usermode technique can bypass kernel-mode detection
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Basic Usage" icon="book" href="/guides/basic-usage">
+    Learn the fundamentals of using syscalls-cpp safely
+  </Card>
+  
+  <Card title="Custom Policies" icon="wrench" href="/guides/custom-policies">
+    Create your own policies tailored to your threat model
+  </Card>
+</CardGroup>

@@ -1,0 +1,501 @@
+---
+title: "Stub Generation Policies"
+description: "Understanding how syscall stubs are generated: direct syscall instructions, gadget-based execution, and VEH-based exception handling"
+---
+
+## Overview
+
+Stub generation policies control **how syscalls are executed**. Each policy generates different machine code that ultimately invokes the kernel via a system call, but with varying levels of indirection and evasion capability.
+
+All stub generation policies must satisfy the `IsStubGenerationPolicy` concept by providing:
+- `static constexpr bool bRequiresGadget` - Whether the policy needs syscall gadgets from ntdll
+- `static constexpr size_t getStubSize()` - Size of the generated stub in bytes
+- `static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress)` - Generate stub code
+
+## generator::direct
+
+### Overview
+
+The `direct` generator creates classic, self-contained syscall stubs that directly execute the `syscall` instruction (x64) or `call dword ptr fs:[0xC0]` (x86). This is the most straightforward approach.
+
+<Info>
+**Platform Support**: Works on both x86 and x64 Windows platforms with architecture-specific shellcode.
+</Info>
+
+### Implementation Details
+
+Location: `syscall.hpp:309-341`
+
+```cpp
+struct direct
+{
+    static constexpr bool bRequiresGadget = false;
+
+#if SYSCALL_PLATFORM_WINDOWS_64
+    inline static constinit std::array<uint8_t, 18> arrShellcode =
+    {
+        0x51,                               // push rcx
+        0x41, 0x5A,                         // pop r10
+        0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0x00000000 (syscall number placeholder)
+        0x0F, 0x05,                         // syscall
+        0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+        0xFF, 0x64, 0x24, 0xF8              // jmp qword ptr [rsp-8]
+    };
+#elif SYSCALL_PLATFORM_WINDOWS_32
+    inline static constinit std::array<uint8_t, 15> arrShellcode =
+    {
+        0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0x00000000 (syscall number placeholder)
+        0x89, 0xE2,                         // mov edx, esp
+        0x64, 0xFF, 0x15, 0xC0, 0x00, 0x00, 0x00, // call dword ptr fs:[0xC0]
+        0xC3                                // ret
+    };
+#endif
+    
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* /*pGadgetAddress*/)
+    {
+        std::copy_n(arrShellcode.data(), arrShellcode.size(), pBuffer);
+        if constexpr (platform::isWindows64)
+            *reinterpret_cast<uint32_t*>(pBuffer + 4) = uSyscallNumber;
+        else
+            *reinterpret_cast<uint32_t*>(pBuffer + 1) = uSyscallNumber;
+    }
+    
+    static constexpr size_t getStubSize() { return arrShellcode.size(); }
+};
+```
+
+### x64 Shellcode Breakdown
+
+```asm
+; Stub size: 18 bytes
+push rcx                     ; Save RCX
+pop r10                      ; Move RCX to R10 (syscall calling convention)
+mov eax, 0x00000000         ; Load syscall number (patched at runtime)
+syscall                      ; Execute syscall instruction
+add rsp, 8                   ; Adjust stack
+jmp qword ptr [rsp-8]       ; Return to caller
+```
+
+**Why this sequence?**
+- Windows x64 syscall calling convention requires the first parameter in `R10` (not `RCX`)
+- `EAX` holds the syscall number
+- The `syscall` instruction directly transitions to kernel mode
+- Stack adjustment and indirect jump handle the return
+
+### x86 Shellcode Breakdown
+
+```asm
+; Stub size: 15 bytes
+mov eax, 0x00000000         ; Load syscall number (patched at runtime)
+mov edx, esp                ; EDX points to arguments on stack
+call dword ptr fs:[0xC0]    ; Call KiFastSystemCall (WOW64)
+ret                          ; Return to caller
+```
+
+**Why this sequence?**
+- x86 Windows uses `fs:[0xC0]` to reach the syscall dispatcher (WOW64 or native)
+- `EAX` holds the syscall number
+- `EDX` points to the stack frame with arguments
+
+### Security Characteristics
+
+**Advantages**:
+- Simple and fast execution
+- No dependencies on ntdll gadgets
+- Works on all platforms
+- Minimal overhead
+
+**Limitations**:
+- Contains direct `syscall` instruction (easily detected by EDR)
+- No obfuscation or indirection
+- May trigger userland hooks if memory is scanned
+
+<Tip>**Best for**: Compatibility and performance when detection is not a concern</Tip>
+
+## generator::gadget
+
+### Overview
+
+The `gadget` generator avoids direct `syscall` instructions by jumping to existing `syscall; ret` gadgets found in ntdll.dll. This provides indirection and uses legitimate Windows code for the actual syscall.
+
+<Warning>
+**Platform Limitation**: Only available on x64 Windows. x86 does not support this approach.
+</Warning>
+
+### Implementation Details
+
+Location: `syscall.hpp:263-293`
+
+```cpp
+#if SYSCALL_PLATFORM_WINDOWS_64
+struct gadget
+{
+    static constexpr bool bRequiresGadget = true;
+    static constexpr size_t getStubSize() { return 32; }
+    
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress)
+    {
+        // mov r10, rcx
+        pBuffer[0] = 0x49;
+        pBuffer[1] = 0x89;
+        pBuffer[2] = 0xCA;
+
+        // mov eax, syscallNumber
+        pBuffer[3] = 0xB8;
+        *reinterpret_cast<uint32_t*>(&pBuffer[4]) = uSyscallNumber;
+
+        // mov r11, gadgetAddress
+        pBuffer[8] = 0x49;
+        pBuffer[9] = 0xBB;
+        *reinterpret_cast<uint64_t*>(&pBuffer[10]) = reinterpret_cast<uint64_t>(pGadgetAddress);
+
+        // push r11
+        pBuffer[18] = 0x41;
+        pBuffer[19] = 0x53;
+
+        // ret
+        pBuffer[20] = 0xC3;
+    }
+};
+#endif
+```
+
+### x64 Shellcode Breakdown
+
+```asm
+; Stub size: 32 bytes (21 bytes used, rest is padding)
+mov r10, rcx                ; Move first parameter to R10
+mov eax, 0x00000000        ; Load syscall number (patched)
+mov r11, 0x0000000000000000 ; Load gadget address (patched)
+push r11                    ; Push gadget address to stack
+ret                         ; Jump to gadget (syscall; ret)
+```
+
+**Execution flow**:
+1. Set up syscall number in `EAX`
+2. Move first parameter to `R10`
+3. Load the address of a `syscall; ret` gadget from ntdll
+4. Jump to the gadget using `push` + `ret`
+5. Gadget executes `syscall` then returns normally
+
+### Gadget Discovery
+
+Location: `syscall.hpp:896-924`
+
+The library scans ntdll's `.text` section for `syscall; ret` sequences:
+
+```cpp
+bool findSyscallGadgets()
+{
+    // ... get ntdll module info ...
+    
+    // Find .text section
+    IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(ntdll.m_pNtHeaders);
+    uint8_t* pTextSection = nullptr;
+    uint32_t uTextSectionSize = 0;
+    
+    for (int i = 0; i < ntdll.m_pNtHeaders->FileHeader.NumberOfSections; ++i)
+    {
+        if (hashing::calculateHashRuntime(reinterpret_cast<const char*>(pSections[i].Name)) 
+            == hashing::calculateHash(".text"))
+        {
+            pTextSection = ntdll.m_pModuleBase + pSections[i].VirtualAddress;
+            uTextSectionSize = pSections[i].Misc.VirtualSize;
+            break;
+        }
+    }
+
+    // Scan for 0x0F 0x05 0xC3 (syscall; ret)
+    m_vecSyscallGadgets.clear();
+    for (DWORD i = 0; i < uTextSectionSize - 2; ++i)
+    {
+        if (pTextSection[i] == 0x0F && pTextSection[i + 1] == 0x05 && pTextSection[i + 2] == 0xC3)
+            m_vecSyscallGadgets.push_back(&pTextSection[i]);
+    }
+
+    return !m_vecSyscallGadgets.empty();
+}
+```
+
+### Random Gadget Selection
+
+For OPSEC, a random gadget is selected at stub generation time:
+
+```cpp
+const size_t uRandomIndex = native::rdtscp() % uGadgetsCount;
+pGadgetForStub = m_vecSyscallGadgets[uRandomIndex];
+```
+
+### Security Characteristics
+
+**Advantages**:
+- No direct `syscall` instruction in your code
+- Uses legitimate Windows code from ntdll
+- Harder to detect with simple signature scanning
+- Random gadget selection increases entropy
+
+**Limitations**:
+- Requires gadget discovery (initialization overhead)
+- x64 only
+- Slightly larger stub size (32 bytes vs 18 bytes)
+- Returns to stack-based address (may trigger stack checks)
+
+<Tip>**Best for**: EDR evasion when you want to avoid direct syscall instructions</Tip>
+
+## generator::exception
+
+### Overview
+
+The `exception` generator uses a Vectored Exception Handler (VEH) to execute syscalls. Instead of a `syscall` instruction, it generates an illegal instruction (`ud2`) that triggers an exception. The VEH catches this exception and redirects execution to a syscall gadget.
+
+<Info>
+**Novel Approach**: This technique is unique because the syscall never appears in the stub code itself—only an illegal instruction that gets handled at runtime.
+</Info>
+
+### Implementation Details
+
+Location: `syscall.hpp:296-307`
+
+```cpp
+struct exception
+{
+    static constexpr bool bRequiresGadget = true;
+    static constexpr size_t getStubSize() { return 8; }
+    
+    static void generate(uint8_t* pBuffer, uint32_t /*uSyscallNumber*/, void* /*pGadgetAddress*/)
+    {
+        pBuffer[0] = 0x0F;  // ud2 instruction (illegal instruction)
+        pBuffer[1] = 0x0B;
+        pBuffer[2] = 0xC3;  // ret
+        std::fill_n(pBuffer + 3, getStubSize() - 3, 0x90);  // NOP padding
+    }
+};
+```
+
+### Stub Code
+
+```asm
+; Stub size: 8 bytes
+ud2                         ; Trigger EXCEPTION_ILLEGAL_INSTRUCTION
+ret                         ; (never reached normally)
+nop                         ; Padding
+nop
+nop
+nop
+nop
+```
+
+### Exception Handler
+
+Location: `syscall.hpp:77-109`
+
+```cpp
+static LONG NTAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
+{
+    if (!pExceptionContext.m_bShouldHandle)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (pExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+        pExceptionInfo->ExceptionRecord->ExceptionAddress == pExceptionContext.m_pExpectedExceptionAddress)
+    {
+        pExceptionContext.m_bShouldHandle = false;
+        
+#if SYSCALL_PLATFORM_WINDOWS_64
+        // Set up syscall arguments and redirect to gadget
+        pExceptionInfo->ContextRecord->R10 = pExceptionInfo->ContextRecord->Rcx;
+        pExceptionInfo->ContextRecord->Rax = pExceptionContext.m_uSyscallNumber;
+        pExceptionInfo->ContextRecord->Rip = reinterpret_cast<uintptr_t>(pExceptionContext.m_pSyscallGadget);
+#else
+        // x86 handling
+        uintptr_t uReturnAddressAfterSyscall = reinterpret_cast<uintptr_t>(pExceptionInfo->ExceptionRecord->ExceptionAddress) + 2;
+        pExceptionInfo->ContextRecord->Edx = pExceptionInfo->ContextRecord->Esp;
+        pExceptionInfo->ContextRecord->Esp -= sizeof(uintptr_t);
+        *reinterpret_cast<uintptr_t*>(pExceptionInfo->ContextRecord->Esp) = uReturnAddressAfterSyscall;
+        pExceptionInfo->ContextRecord->Eip = reinterpret_cast<uintptr_t>(pExceptionContext.m_pSyscallGadget);
+        pExceptionInfo->ContextRecord->Eax = pExceptionContext.m_uSyscallNumber;
+#endif
+
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+```
+
+### Exception Context Guard
+
+Location: `syscall.hpp:57-75`
+
+A RAII guard sets up the exception context before each syscall:
+
+```cpp
+class CExceptionContextGuard
+{
+public:
+    CExceptionContextGuard(const void* pExpectedAddress, void* pSyscallGadget, uint32_t uSyscallNumber)
+    {
+        pExceptionContext.m_bShouldHandle = true;
+        pExceptionContext.m_pExpectedExceptionAddress = pExpectedAddress;
+        pExceptionContext.m_pSyscallGadget = pSyscallGadget;
+        pExceptionContext.m_uSyscallNumber = uSyscallNumber;
+    }
+
+    ~CExceptionContextGuard()
+    {
+        pExceptionContext.m_bShouldHandle = false;
+    }
+
+    CExceptionContextGuard(const CExceptionContextGuard&) = delete;
+    CExceptionContextGuard& operator=(const CExceptionContextGuard&) = delete;
+};
+```
+
+### Execution Flow
+
+<Steps>
+  <Step title="Setup Exception Context">
+    Before invoking a syscall, `CExceptionContextGuard` stores:
+    - Expected exception address (the `ud2` instruction)
+    - Target syscall gadget address
+    - Syscall number
+  </Step>
+  
+  <Step title="Execute ud2">
+    The stub executes `ud2`, triggering `EXCEPTION_ILLEGAL_INSTRUCTION`
+  </Step>
+  
+  <Step title="VEH Catches Exception">
+    The vectored exception handler checks if:
+    - Exception code is `EXCEPTION_ILLEGAL_INSTRUCTION`
+    - Exception address matches the expected stub address
+  </Step>
+  
+  <Step title="Context Modification">
+    The handler modifies the CPU context:
+    - Sets `RAX`/`EAX` to the syscall number
+    - Sets `R10`/`EDX` to the first parameter
+    - Redirects `RIP`/`EIP` to the syscall gadget
+  </Step>
+  
+  <Step title="Resume Execution">
+    Exception handling returns with `EXCEPTION_CONTINUE_EXECUTION`, and the thread resumes at the gadget, executing the syscall
+  </Step>
+</Steps>
+
+### Invocation Code
+
+Location: `syscall.hpp:797-816`
+
+```cpp
+if constexpr (std::is_same_v<IStubGenerationPolicy, policies::generator::exception>)
+{
+#if SYSCALL_PLATFORM_WINDOWS_64
+    const size_t uGadgetCount = m_vecSyscallGadgets.size();
+    if (!uGadgetCount)
+    {
+        if constexpr (std::is_same_v<Ret, NTSTATUS>)
+            return native::STATUS_UNSUCCESSFUL;
+        return Ret{};
+    }
+
+    const size_t uRandomIndex = native::rdtscp() % uGadgetCount;
+    void* pRandomGadget = m_vecSyscallGadgets[uRandomIndex];
+#else
+    void* pRandomGadget = (void*)__readfsdword(0xC0);
+#endif
+
+    CExceptionContextGuard contextGuard(pStubAddress, pRandomGadget, it->m_uSyscallNumber);
+    return reinterpret_cast<Function_t>(pStubAddress)(std::forward<Args>(args)...);
+}
+```
+
+### Security Characteristics
+
+**Advantages**:
+- Smallest stub size (8 bytes)
+- No `syscall` instruction in stub code
+- Maximum obfuscation—stub looks like broken/invalid code
+- Difficult to detect with static analysis
+- VEH provides additional layer of indirection
+- Random gadget selection on each invocation
+
+**Limitations**:
+- Exception handling overhead (slower than direct)
+- Requires VEH registration
+- More complex debugging
+- VEH can be monitored by security products
+- Thread-local exception context required
+
+<Tip>**Best for**: Maximum stealth when performance is less critical than evasion</Tip>
+
+## Comparison Matrix
+
+| Feature | `direct` | `gadget` | `exception` |
+|---------|----------|----------|--------------|
+| **Stub Size (x64)** | 18 bytes | 32 bytes | 8 bytes |
+| **Platform** | x86 + x64 | x64 only | x86 + x64 |
+| **Requires Gadgets** | ❌ No | ✅ Yes | ✅ Yes |
+| **Performance** | Fastest | Fast | Slower (exception overhead) |
+| **Stealth** | Low | Medium | High |
+| **Contains syscall** | ✅ Yes | ❌ No | ❌ No |
+| **Complexity** | Low | Medium | High |
+| **Detection Risk** | High | Medium | Low |
+
+## Choosing the Right Policy
+
+<Steps>
+  <Step title="Maximum Performance">
+    Use `generator::direct` when speed is critical and detection is not a concern. Simple and reliable.
+  </Step>
+  
+  <Step title="Balanced Evasion">
+    Use `generator::gadget` (x64 only) to avoid direct syscall instructions while maintaining good performance.
+  </Step>
+  
+  <Step title="Maximum Stealth">
+    Use `generator::exception` when evading advanced detection is the priority and you can accept the performance overhead.
+  </Step>
+</Steps>
+
+## Usage Examples
+
+<CodeGroup>
+```cpp Direct Generator
+using DirectManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct,   // Fast, simple
+    syscall::DefaultParserChain
+>;
+
+DirectManager manager;
+manager.initialize();
+```
+
+```cpp Gadget Generator (x64 only)
+using GadgetManager = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::gadget,   // Indirect via ntdll
+    syscall::DefaultParserChain
+>;
+
+GadgetManager manager;
+manager.initialize();
+```
+
+```cpp Exception Generator
+using StealthManager = syscall::Manager<
+    syscall::policies::allocator::memory,
+    syscall::policies::generator::exception, // Maximum stealth
+    syscall::DefaultParserChain
+>;
+
+StealthManager manager;
+manager.initialize();
+```
+</CodeGroup>
+
+## Next Steps
+
+<Card title="Parsing Policies" icon="magnifying-glass" href="/core-concepts/parsing-policies">
+  Learn how syscall numbers are resolved from ntdll
+</Card>

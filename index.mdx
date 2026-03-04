@@ -1,97 +1,283 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: syscalls-cpp
+description: A modern C++20 header-only library for advanced direct system call invocation
+mode: custom
 ---
 
-## Setting up
+<div className="relative overflow-hidden bg-gradient-to-br from-[#0f1117] via-[#1a1d27] to-[#0f1117] dark:from-[#0f1117] dark:via-[#1a1d27] dark:to-[#0f1117] py-20">
+  <div className="max-w-7xl mx-auto px-6 lg:px-8">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+      <div className="lg:col-span-7">
+        <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6">
+          Undetectable System Call Invocation
+        </h1>
+        <p className="text-lg sm:text-xl text-gray-300 dark:text-gray-300 max-w-2xl mb-8">
+          A C++20 policy-based framework for crafting protected syscalls with compile-time flexibility. Mix and match allocation, stub generation, and parsing strategies for ultimate operational security.
+        </p>
+        <div className="flex flex-wrap gap-4">
+          <a
+            href="/quickstart"
+            className="inline-flex items-center justify-center px-6 py-3 rounded-lg bg-[#242b2c] hover:bg-[#3a4245] text-white font-semibold transition-colors"
+          >
+            Get Started
+          </a>
+          <a
+            href="/api/manager"
+            className="inline-flex items-center justify-center px-6 py-3 rounded-lg border border-white/30 bg-white/10 hover:bg-white/20 text-white font-semibold transition-colors"
+          >
+            API Reference
+          </a>
+        </div>
+      </div>
+      <div className="lg:col-span-5 flex justify-center lg:justify-end">
+        <div className="relative w-full max-w-md">
+          <div className="absolute inset-0 bg-gradient-to-r from-[#242b2c] to-[#3a4245] opacity-20 blur-3xl"></div>
+          <div className="relative bg-[#1a1d27] dark:bg-[#1a1d27] border border-[#27272a] dark:border-[#27272a] rounded-2xl p-6 shadow-2xl">
+            <div className="flex items-center gap-2 mb-4">
+              <div className="w-3 h-3 rounded-full bg-red-500"></div>
+              <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
+              <div className="w-3 h-3 rounded-full bg-green-500"></div>
+            </div>
+            <pre className="text-sm text-gray-300 dark:text-gray-300 overflow-x-auto">
+              <code>{`SyscallSectionDirect syscallManager;
+syscallManager.initialize();
 
-Get your documentation site up and running in minutes.
+PVOID pBaseAddress = nullptr;
+SIZE_T uSize = 0x1000;
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+syscallManager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pBaseAddress,
+    0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);`}</code>
+            </pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-## Make it yours
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">
+      Quick Start
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Get up and running with syscalls-cpp in three simple steps
+    </p>
+  </div>
 
-Design a docs site that looks great and empowers your users.
+  <Steps>
+    <Step title="Install via vcpkg">
+      Install the library using the C++ package manager vcpkg:
+      
+      ```bash
+      vcpkg install syscalls-cpp
+      ```
+      
+      Alternatively, clone the repository and add the `include` directory to your project's include paths for manual integration.
+    </Step>
+    
+    <Step title="Include the header">
+      Include the main syscall header in your C++20 project:
+      
+      ```cpp
+      #include <syscalls-cpp/syscall.hpp>
+      ```
+      
+      The library is header-only with zero runtime dependencies, requiring only a C++20 compatible compiler.
+    </Step>
+    
+    <Step title="Create and invoke syscalls">
+      Initialize a syscall manager with your chosen policies and invoke Windows system calls directly:
+      
+      ```cpp
+      SyscallSectionDirect syscallManager;
+      if (!syscallManager.initialize()) {
+          std::cerr << "Initialization failed!\n";
+          return 1;
+      }
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
-  </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
-  </Card>
+      PVOID pBaseAddress = nullptr;
+      SIZE_T uSize = 0x1000;
+      
+      syscallManager.invoke<NTSTATUS>(
+          SYSCALL_ID("NtAllocateVirtualMemory"),
+          NtCurrentProcess(),
+          &pBaseAddress,
+          0, &uSize,
+          MEM_COMMIT | MEM_RESERVE,
+          PAGE_READWRITE
+      );
+      ```
+      
+      <Note>
+        Always use `nullptr` instead of `NULL` on x64 platforms to avoid stack corruption from improper pointer extension.
+      </Note>
+    </Step>
+  </Steps>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">
+      Explore by Topic
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Dive into the core concepts and learn how to customize syscalls-cpp for your needs
+    </p>
+  </div>
+
+  <CardGroup cols={2}>
     <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
-  </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+      title="Core Concepts"
+      icon="lightbulb"
+      href="/core-concepts/overview"
+    >
+      Understand the policy-based architecture and how allocation, stub generation, and parsing policies work together.
+    </Card>
+    <Card
+      title="Allocation Policies"
+      icon="memory"
+      href="/core-concepts/allocation-policies"
+    >
+      Learn about section-based, heap-based, and virtual memory allocation strategies for syscall stubs.
+    </Card>
+    <Card
+      title="Stub Generation"
+      icon="code"
+      href="/core-concepts/stub-generation-policies"
+    >
+      Explore direct, gadget-based, and exception-based stub generation approaches for different evasion techniques.
+    </Card>
+    <Card
+      title="Custom Policies"
+      icon="wrench"
+      href="/guides/custom-policies"
+    >
+      Extend the framework by writing your own allocation, generation, or parsing policies using C++20 concepts.
+    </Card>
+  </CardGroup>
+</div>
 
-## Create beautiful pages
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">
+      Key Features
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
+      Why developers choose syscalls-cpp for advanced Windows security research
+    </p>
+  </div>
 
-Everything you need to create world-class documentation.
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <div className="bg-white dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-xl p-6 hover:border-[#242b2c] dark:hover:border-[#242b2c] transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#242b2c]/10 dark:bg-[#242b2c]/20 flex items-center justify-center">
+          <svg className="w-5 h-5 text-[#242b2c] dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-2">Policy-Based Design</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Mix and match allocation, stub generation, and parsing strategies at compile-time for maximum flexibility.</p>
+        </div>
+      </div>
+    </div>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+    <div className="bg-white dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-xl p-6 hover:border-[#242b2c] dark:hover:border-[#242b2c] transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#242b2c]/10 dark:bg-[#242b2c]/20 flex items-center justify-center">
+          <svg className="w-5 h-5 text-[#242b2c] dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-2">Hook Detection & Evasion</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Automatically detects function hooks and resolves syscall numbers from neighboring functions using improved halo gates.</p>
+        </div>
+      </div>
+    </div>
 
-## Need inspiration?
+    <div className="bg-white dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-xl p-6 hover:border-[#242b2c] dark:hover:border-[#242b2c] transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#242b2c]/10 dark:bg-[#242b2c]/20 flex items-center justify-center">
+          <svg className="w-5 h-5 text-[#242b2c] dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-2">SEC_NO_CHANGE Protection</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">Allocate syscall stubs in memory sections with SEC_NO_CHANGE flag to prevent runtime patching attempts.</p>
+        </div>
+      </div>
+    </div>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    <div className="bg-white dark:bg-[#1a1d27] border border-gray-200 dark:border-[#27272a] rounded-xl p-6 hover:border-[#242b2c] dark:hover:border-[#242b2c] transition-colors">
+      <div className="flex items-start gap-4">
+        <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-[#242b2c]/10 dark:bg-[#242b2c]/20 flex items-center justify-center">
+          <svg className="w-5 h-5 text-[#242b2c] dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
+          </svg>
+        </div>
+        <div>
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-2">Compile-Time Hashing</h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400">String identifiers are hashed at compile-time using consteval functions for operational security and obfuscation.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="text-center mb-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">
+      Resources
+    </h2>
+  </div>
+
+  <CardGroup cols={3}>
+    <Card
+      title="Examples"
+      icon="flask"
+      href="/examples/direct-syscalls"
+    >
+      Explore working examples of direct, gadget-based, and exception-based syscall techniques.
+    </Card>
+    <Card
+      title="API Reference"
+      icon="book"
+      href="/api/manager"
+    >
+      Complete API documentation for the Manager class, policies, and utility functions.
+    </Card>
+    <Card
+      title="GitHub Repository"
+      icon="github"
+      href="https://github.com/sapdragon/syscalls-cpp"
+    >
+      View the source code, report issues, and contribute to the project.
+    </Card>
+  </CardGroup>
+</div>
+
+<div className="mt-20 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-br from-[#242b2c] to-[#3a4245] dark:from-[#242b2c] dark:to-[#3a4245] rounded-2xl p-8 lg:p-12 text-center border border-[#27272a] dark:border-[#27272a]">
+    <h2 className="text-3xl font-bold text-white mb-4">
+      Ready to Build Undetectable Syscalls?
+    </h2>
+    <p className="text-lg text-gray-300 dark:text-gray-300 mb-8 max-w-2xl mx-auto">
+      Start exploring the policy-based framework and craft your custom syscall strategies today.
+    </p>
+    <a
+      href="/quickstart"
+      className="inline-flex items-center justify-center px-8 py-4 rounded-lg bg-white hover:bg-gray-100 text-[#242b2c] font-semibold transition-colors"
+    >
+      Get Started Now
+    </a>
+  </div>
+</div>

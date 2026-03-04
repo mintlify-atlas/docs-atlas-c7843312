@@ -1,0 +1,233 @@
+---
+title: generator::gadget
+description: Gadget-based syscall stub generation using syscall; ret sequences from ntdll.dll (x64 only)
+---
+
+## Overview
+
+The `generator::gadget` policy generates stubs that jump to `syscall; ret` gadgets found in ntdll.dll's .text section. This provides more legitimate call stacks and can evade some EDR detection techniques.
+
+<Note>
+**Platform Support:** This policy is only available on Windows x64. It is not supported on x86.
+</Note>
+
+## Constants
+
+<ParamField path="bRequiresGadget" type="static constexpr bool">
+  Indicates whether this policy requires syscall gadgets from ntdll.dll
+  
+  ```cpp
+  static constexpr bool bRequiresGadget = true;
+  ```
+  
+  <ResponseField name="value" type="true">
+    Gadget-based stubs require discovering `syscall; ret` sequences in ntdll.dll
+  </ResponseField>
+</ParamField>
+
+## Method Signatures
+
+<ParamField path="getStubSize" type="static constexpr size_t">
+  Returns the size of the generated stub in bytes
+  
+  ```cpp
+  static constexpr size_t getStubSize() { return 32; }
+  ```
+  
+  <ResponseField name="return" type="size_t">
+    32 bytes
+  </ResponseField>
+</ParamField>
+
+<ParamField path="generate" type="static void">
+  Generates the syscall stub that jumps to a gadget
+  
+  ```cpp
+  static void generate(
+      uint8_t* pBuffer,
+      uint32_t uSyscallNumber,
+      void* pGadgetAddress
+  )
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="pBuffer" type="uint8_t*" required>
+      Pointer to the buffer where the stub will be written
+    </ParamField>
+    <ParamField path="uSyscallNumber" type="uint32_t" required>
+      The syscall number to embed in the stub
+    </ParamField>
+    <ParamField path="pGadgetAddress" type="void*" required>
+      Address of the `syscall; ret` gadget to jump to
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Generated Shellcode
+
+### x64 Stub (32 bytes)
+
+From `syscall.hpp:265-291`:
+
+```cpp
+static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress)
+{
+    // mov r10, rcx
+    pBuffer[0] = 0x49;
+    pBuffer[1] = 0x89;
+    pBuffer[2] = 0xCA;
+
+    // mov eax, syscallNumber
+    pBuffer[3] = 0xB8;
+    *reinterpret_cast<uint32_t*>(&pBuffer[4]) = uSyscallNumber;
+
+    // mov r11, gadgetAddress
+    pBuffer[8] = 0x49;
+    pBuffer[9] = 0xBB;
+    *reinterpret_cast<uint64_t*>(&pBuffer[10]) = reinterpret_cast<uint64_t>(pGadgetAddress);
+
+    // push r11
+    pBuffer[18] = 0x41;
+    pBuffer[19] = 0x53;
+
+    // ret
+    pBuffer[20] = 0xC3;
+}
+```
+
+**Assembly breakdown:**
+
+1. `mov r10, rcx` - Move first parameter to R10 (syscall convention)
+2. `mov eax, <syscall_number>` - Load syscall number
+3. `mov r11, <gadget_address>` - Load the address of the `syscall; ret` gadget
+4. `push r11` - Push the gadget address onto the stack
+5. `ret` - "Return" to the gadget address, which executes `syscall; ret`
+
+## Gadget Discovery
+
+The `Manager` class discovers gadgets by scanning ntdll.dll's .text section for the byte sequence `0x0F 0x05 0xC3` (syscall; ret):
+
+```cpp
+// From syscall.hpp:895-924
+bool findSyscallGadgets()
+{
+    ModuleInfo_t ntdll;
+    if (!getModuleInfo(SYSCALL_ID("ntdll.dll"), ntdll))
+        return false;
+
+    IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(ntdll.m_pNtHeaders);
+    uint8_t* pTextSection = nullptr;
+    uint32_t uTextSectionSize = 0;
+    
+    // Find .text section
+    for (int i = 0; i < ntdll.m_pNtHeaders->FileHeader.NumberOfSections; ++i)
+    {
+        if (hashing::calculateHashRuntime(
+            reinterpret_cast<const char*>(pSections[i].Name)) == 
+            hashing::calculateHash(".text"))
+        {
+            pTextSection = ntdll.m_pModuleBase + pSections[i].VirtualAddress;
+            uTextSectionSize = pSections[i].Misc.VirtualSize;
+            break;
+        }
+    }
+
+    if (!pTextSection || !uTextSectionSize)
+        return false;
+
+    // Scan for syscall; ret gadgets (0x0F 0x05 0xC3)
+    m_vecSyscallGadgets.clear();
+    for (DWORD i = 0; i < uTextSectionSize - 2; ++i)
+        if (pTextSection[i] == 0x0F && 
+            pTextSection[i + 1] == 0x05 && 
+            pTextSection[i + 2] == 0xC3)
+            m_vecSyscallGadgets.push_back(&pTextSection[i]);
+
+    return !m_vecSyscallGadgets.empty();
+}
+```
+
+<Info>
+Gadgets are selected randomly using `rdtscp()` for each syscall invocation, adding variability to execution patterns.
+</Info>
+
+## Usage Example
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+#if SYSCALL_PLATFORM_WINDOWS_64
+// Use the pre-defined type alias
+SyscallSectionGadget syscallManager;
+if (!syscallManager.initialize()) {
+    std::cerr << "Failed to initialize (gadget discovery may have failed)\n";
+    return 1;
+}
+
+// Or compose manually
+using GadgetManager = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::gadget
+>;
+
+GadgetManager manager;
+manager.initialize();
+
+// Invoke syscalls
+PVOID pAddress = nullptr;
+SIZE_T uSize = 0x1000;
+
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pAddress, 0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+#endif
+```
+
+## Security Benefits
+
+<CardGroup cols={2}>
+  <Card title="Call Stack Legitimacy" icon="layer-group">
+    The return address points into ntdll.dll's .text section, making stack traces appear more legitimate.
+  </Card>
+  <Card title="Return Address Validation" icon="shield-check">
+    Some EDR solutions validate return addresses—this technique places them inside ntdll, bypassing such checks.
+  </Card>
+  <Card title="Randomization" icon="shuffle">
+    Random gadget selection adds entropy, making behavior analysis harder.
+  </Card>
+  <Card title="No Direct Syscall" icon="ban">
+    The stub itself doesn't contain a syscall instruction, reducing direct detection risk.
+  </Card>
+</CardGroup>
+
+## Trade-offs
+
+| Aspect | Description |
+|--------|-------------|
+| **Performance** | Slightly slower (indirect jump through ret) |
+| **Stealth** | High (legitimate return addresses) |
+| **Complexity** | Moderate (requires gadget discovery) |
+| **Platform Support** | x64 only |
+| **Use Case** | EDR evasion, security research |
+
+<Warning>
+If gadget discovery fails during initialization, the Manager will fail to initialize. Ensure ntdll.dll has not been stripped or modified.
+</Warning>
+
+## See Also
+
+<CardGroup cols={3}>
+  <Card title="generator::direct" href="/api/policies/generator-direct">
+    Direct syscall stub generation
+  </Card>
+  <Card title="generator::exception" href="/api/policies/generator-exception">
+    Exception-based stub generation
+  </Card>
+  <Card title="Gadget Syscalls Example" href="/examples/gadget-syscalls">
+    Complete working example
+  </Card>
+</CardGroup>

@@ -1,0 +1,274 @@
+---
+title: generator::exception
+description: Exception-based syscall stub generation using Vectored Exception Handlers (VEH)
+---
+
+## Overview
+
+The `generator::exception` policy generates minimal stubs that trigger an illegal instruction exception (`ud2`). A Vectored Exception Handler (VEH) intercepts the exception and performs the syscall, providing maximum call stack obfuscation.
+
+## Constants
+
+<ParamField path="bRequiresGadget" type="static constexpr bool">
+  Indicates whether this policy requires syscall gadgets from ntdll.dll
+  
+  ```cpp
+  static constexpr bool bRequiresGadget = true;
+  ```
+  
+  <ResponseField name="value" type="true">
+    Exception-based stubs require a gadget to execute the actual syscall from within the exception handler
+  </ResponseField>
+</ParamField>
+
+## Method Signatures
+
+<ParamField path="getStubSize" type="static constexpr size_t">
+  Returns the size of the generated stub in bytes
+  
+  ```cpp
+  static constexpr size_t getStubSize() { return 8; }
+  ```
+  
+  <ResponseField name="return" type="size_t">
+    8 bytes (smallest of all generators)
+  </ResponseField>
+</ParamField>
+
+<ParamField path="generate" type="static void">
+  Generates the exception-triggering stub
+  
+  ```cpp
+  static void generate(
+      uint8_t* pBuffer,
+      uint32_t /*uSyscallNumber*/,
+      void* /*pGadgetAddress*/
+  )
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="pBuffer" type="uint8_t*" required>
+      Pointer to the buffer where the stub will be written
+    </ParamField>
+    <ParamField path="uSyscallNumber" type="uint32_t">
+      Unused (syscall number is passed via exception context)
+    </ParamField>
+    <ParamField path="pGadgetAddress" type="void*">
+      Unused (gadget address is passed via exception context)
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Generated Shellcode
+
+### Stub (8 bytes)
+
+From `syscall.hpp:296-307`:
+
+```cpp
+struct exception
+{
+    static constexpr bool bRequiresGadget = true;
+    static constexpr size_t getStubSize() { return 8; }
+    
+    static void generate(uint8_t* pBuffer, uint32_t /*uSyscallNumber*/, void* /*pGadgetAddress*/)
+    {
+        pBuffer[0] = 0x0F;  // ud2 (illegal instruction)
+        pBuffer[1] = 0x0B;
+        pBuffer[2] = 0xC3;  // ret
+        std::fill_n(pBuffer + 3, getStubSize() - 3, 0x90);  // nop padding
+    }
+};
+```
+
+**Assembly breakdown:**
+
+1. `ud2` - Trigger an `EXCEPTION_ILLEGAL_INSTRUCTION` exception
+2. `ret` - Return instruction (executed after exception handler completes)
+3. `nop` (x5) - Padding to fill the 8-byte stub size
+
+## Exception Handler
+
+The Vectored Exception Handler performs the actual syscall:
+
+### Thread-Local Exception Context
+
+From `syscall.hpp:49-75`:
+
+```cpp
+inline thread_local struct ExceptionContext_t
+{
+    bool m_bShouldHandle = false;
+    const void* m_pExpectedExceptionAddress = nullptr;
+    void* m_pSyscallGadget = nullptr;
+    uint32_t m_uSyscallNumber = 0;
+} pExceptionContext;
+
+class CExceptionContextGuard
+{
+public:
+    CExceptionContextGuard(const void* pExpectedAddress, void* pSyscallGadget, 
+                          uint32_t uSyscallNumber)
+    {
+        pExceptionContext.m_bShouldHandle = true;
+        pExceptionContext.m_pExpectedExceptionAddress = pExpectedAddress;
+        pExceptionContext.m_pSyscallGadget = pSyscallGadget;
+        pExceptionContext.m_uSyscallNumber = uSyscallNumber;
+    }
+
+    ~CExceptionContextGuard()
+    {
+        pExceptionContext.m_bShouldHandle = false;
+    }
+
+    CExceptionContextGuard(const CExceptionContextGuard&) = delete;
+    CExceptionContextGuard& operator=(const CExceptionContextGuard&) = delete;
+};
+```
+
+### VEH Implementation
+
+From `syscall.hpp:77-109`:
+
+```cpp
+static LONG NTAPI VectoredExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo)
+{
+    if (!pExceptionContext.m_bShouldHandle)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (pExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+        pExceptionInfo->ExceptionRecord->ExceptionAddress == pExceptionContext.m_pExpectedExceptionAddress)
+    {
+        pExceptionContext.m_bShouldHandle = false;
+        
+#if SYSCALL_PLATFORM_WINDOWS_64
+        // Set up registers for syscall
+        pExceptionInfo->ContextRecord->R10 = pExceptionInfo->ContextRecord->Rcx;
+        pExceptionInfo->ContextRecord->Rax = pExceptionContext.m_uSyscallNumber;
+        pExceptionInfo->ContextRecord->Rip = reinterpret_cast<uintptr_t>(pExceptionContext.m_pSyscallGadget);
+#else
+        // x86 setup
+        uintptr_t uReturnAddressAfterSyscall = 
+            reinterpret_cast<uintptr_t>(pExceptionInfo->ExceptionRecord->ExceptionAddress) + 2;
+        pExceptionInfo->ContextRecord->Edx = pExceptionInfo->ContextRecord->Esp;
+        pExceptionInfo->ContextRecord->Esp -= sizeof(uintptr_t);
+        *reinterpret_cast<uintptr_t*>(pExceptionInfo->ContextRecord->Esp) = uReturnAddressAfterSyscall;
+        pExceptionInfo->ContextRecord->Eip = reinterpret_cast<uintptr_t>(pExceptionContext.m_pSyscallGadget);
+        pExceptionInfo->ContextRecord->Eax = pExceptionContext.m_uSyscallNumber;
+#endif
+
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+```
+
+## Execution Flow
+
+<Steps>
+  <Step title="Stub invocation">
+    The caller invokes the stub, which executes `ud2`, triggering an exception.
+  </Step>
+  
+  <Step title="Exception dispatch">
+    Windows dispatches the exception to registered Vectored Exception Handlers.
+  </Step>
+  
+  <Step title="Context validation">
+    The VEH checks if the exception address matches the expected stub address and the exception code is `EXCEPTION_ILLEGAL_INSTRUCTION`.
+  </Step>
+  
+  <Step title="Register setup">
+    The handler modifies the CPU context: sets EAX/RAX to the syscall number, R10 to RCX (x64), and RIP/EIP to the gadget address.
+  </Step>
+  
+  <Step title="Syscall execution">
+    Execution resumes at the gadget, which executes the syscall and returns.
+  </Step>
+  
+  <Step title="Return to caller">
+    The syscall result propagates back through the exception mechanism to the original caller.
+  </Step>
+</Steps>
+
+## Usage Example
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+using ExceptionManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::exception
+>;
+
+ExceptionManager manager;
+if (!manager.initialize()) {
+    std::cerr << "Failed to initialize\n";
+    return 1;
+}
+
+// The VEH is automatically registered during initialization
+// Invoke syscalls normally
+PVOID pAddress = nullptr;
+SIZE_T uSize = 0x1000;
+
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pAddress, 0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+
+// VEH is automatically unregistered when manager is destroyed
+```
+
+## Security Benefits
+
+<CardGroup cols={2}>
+  <Card title="Call Stack Obfuscation" icon="eye-slash">
+    The call stack shows exception handling frames, masking the true intent of the syscall.
+  </Card>
+  <Card title="No Syscall Instructions" icon="ban">
+    The stub contains no syscall or call instructions—just `ud2; ret; nop`.
+  </Card>
+  <Card title="Minimal Footprint" icon="compress">
+    Only 8 bytes per stub, the smallest of all generators.
+  </Card>
+  <Card title="Thread Safety" icon="lock">
+    Thread-local context ensures safe concurrent syscall execution.
+  </Card>
+</CardGroup>
+
+## Trade-offs
+
+| Aspect | Description |
+|--------|-------------|
+| **Performance** | Slowest (50-100x overhead from exception handling) |
+| **Stealth** | Highest (completely obfuscated execution) |
+| **Complexity** | Most complex (VEH, context manipulation) |
+| **Platform Support** | x86 and x64 |
+| **Use Case** | Maximum stealth, research, red team operations |
+
+<Warning>
+**Performance Impact:** Exception-based syscalls are significantly slower due to exception dispatching overhead. Use this policy only when maximum stealth is required, not for performance-critical code.
+</Warning>
+
+## Thread Safety
+
+The exception context is `thread_local`, ensuring that concurrent syscalls from multiple threads don't interfere with each other. Each thread maintains its own exception context.
+
+## See Also
+
+<CardGroup cols={3}>
+  <Card title="generator::direct" href="/api/policies/generator-direct">
+    Direct syscall stub generation
+  </Card>
+  <Card title="generator::gadget" href="/api/policies/generator-gadget">
+    Gadget-based stub generation
+  </Card>
+  <Card title="Exception Syscalls Example" href="/examples/exception-syscalls">
+    Complete working example
+  </Card>
+</CardGroup>

@@ -1,0 +1,629 @@
+---
+title: Custom Policies
+description: Learn how to write custom allocation, stub generation, and parsing policies for syscalls-cpp
+---
+
+## Overview
+
+The power of syscalls-cpp lies in its extensibility through policy-based design. You can create custom policies to implement your own memory allocation strategies, stub generation techniques, or syscall number parsing methods.
+
+All policies are validated at compile-time using C++20 concepts, ensuring type safety and proper implementation.
+
+## Policy Types
+
+syscalls-cpp supports three types of policies:
+
+1. **Allocation Policies** - Control how memory for syscall stubs is allocated
+2. **Stub Generation Policies** - Define how syscall stub code is generated
+3. **Parsing Policies** - Determine how syscall numbers are resolved from system modules
+
+## Allocation Policies
+
+### Concept Requirements
+
+An allocation policy must satisfy the `IsIAllocationPolicy` concept:
+
+```cpp
+template<typename T>
+concept IsIAllocationPolicy = requires(size_t uSize, 
+                                      const std::span<const uint8_t> vecBuffer, 
+                                      void*& pRegion, 
+                                      HANDLE& hObject)
+{
+    { T::allocate(uSize, vecBuffer, pRegion, hObject) } -> std::convertible_to<bool>;
+    { T::release(pRegion, hObject) } -> std::same_as<void>;
+};
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:604-609*
+
+### Required Methods
+
+#### allocate
+
+```cpp
+static bool allocate(size_t uRegionSize, 
+                    const std::span<const uint8_t> vecBuffer, 
+                    void*& pOutRegion, 
+                    HANDLE& hOutHandle);
+```
+
+**Parameters:**
+- `uRegionSize` - Size of memory region needed
+- `vecBuffer` - Buffer containing the generated stub code
+- `pOutRegion` - [out] Pointer to allocated executable memory
+- `hOutHandle` - [out] Handle to resource (if needed, otherwise unused)
+
+**Returns:** `true` on success, `false` on failure
+
+#### release
+
+```cpp
+static void release(void* pRegion, HANDLE hHandle);
+```
+
+**Parameters:**
+- `pRegion` - Memory region to release
+- `hHandle` - Resource handle to close (if applicable)
+
+### Built-in Allocation Policies
+
+<AccordionGroup>
+  <Accordion title="allocator::section - SEC_NO_CHANGE Protection">
+    Uses `NtCreateSection` with the `SEC_NO_CHANGE` flag to create immutable executable memory that cannot be modified, even by the allocating process.
+
+    ```cpp
+    struct section
+    {
+        static bool allocate(size_t uRegionSize, 
+                           const std::span<const uint8_t> vecBuffer, 
+                           void*& pOutRegion, 
+                           HANDLE& /*unused*/)
+        {
+            // Get function pointers
+            auto fNtCreateSection = /* ... */;
+            auto fNtMapView = /* ... */;
+            
+            // Create section with SEC_NO_CHANGE
+            NTSTATUS status = fNtCreateSection(
+                &hSectionHandle, 
+                SECTION_ALL_ACCESS, 
+                nullptr, 
+                &sectionSize, 
+                PAGE_EXECUTE_READWRITE, 
+                SEC_COMMIT | SECTION_NO_CHANGE, 
+                nullptr
+            );
+            
+            // Map as RW, write stubs, unmap
+            // Map as RX for execution
+            // ...
+        }
+        
+        static void release(void* pRegion, HANDLE /*hHeapHandle*/)
+        {
+            auto fNtUnmapView = /* ... */;
+            if (fNtUnmapView)
+                fNtUnmapView(syscall::native::getCurrentProcess(), pRegion);
+        }
+    };
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:115-165*
+  </Accordion>
+
+  <Accordion title="allocator::heap - Executable Heap">
+    Creates a private executable heap using `RtlCreateHeap` with the `HEAP_CREATE_ENABLE_EXECUTE` flag.
+
+    ```cpp
+    struct heap
+    {
+        static bool allocate(size_t uRegionSize, 
+                           const std::span<const uint8_t> vecBuffer, 
+                           void*& pOutRegion, 
+                           HANDLE& hOutHeapHandle)
+        {
+            hOutHeapHandle = fRtlCreateHeap(
+                HEAP_CREATE_ENABLE_EXECUTE | HEAP_GROWABLE, 
+                nullptr, 0, 0, nullptr, nullptr
+            );
+            
+            pOutRegion = fRtlAllocateHeap(hOutHeapHandle, 0, uRegionSize);
+            std::copy_n(vecBuffer.data(), uRegionSize, 
+                       static_cast<uint8_t*>(pOutRegion));
+            return true;
+        }
+        
+        static void release(void* /*region*/, HANDLE hHeapHandle)
+        {
+            if (hHeapHandle)
+                fRtlDestroyHeap(hHeapHandle);
+        }
+    };
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:167-209*
+  </Accordion>
+
+  <Accordion title="allocator::memory - Virtual Memory">
+    Uses `NtAllocateVirtualMemory` to allocate memory with page protection transition (RW → RX).
+
+    ```cpp
+    struct memory
+    {
+        static bool allocate(size_t uRegionSize, 
+                           const std::span<const uint8_t> vecBuffer, 
+                           void*& pOutRegion, 
+                           HANDLE& /*unused*/)
+        {
+            // Allocate as RW
+            fNtAllocate(getCurrentProcess(), &pOutRegion, 0, &uSize, 
+                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            
+            // Copy stubs
+            std::copy_n(vecBuffer.data(), uRegionSize, 
+                       static_cast<uint8_t*>(pOutRegion));
+            
+            // Change to RX
+            fNtProtect(getCurrentProcess(), &pOutRegion, &uSize, 
+                      PAGE_EXECUTE_READ, &oldProtection);
+            return true;
+        }
+        
+        static void release(void* pRegion, HANDLE /*heapHandle*/)
+        {
+            SIZE_T uSize = 0;
+            fNtFree(getCurrentProcess(), &pRegion, &uSize, MEM_RELEASE);
+        }
+    };
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:211-259*
+  </Accordion>
+</AccordionGroup>
+
+## Stub Generation Policies
+
+### Concept Requirements
+
+A stub generation policy must satisfy the `IsStubGenerationPolicy` concept:
+
+```cpp
+template<typename T>
+concept IsStubGenerationPolicy = requires(uint8_t* pBuffer, 
+                                         uint32_t uSyscallNumber, 
+                                         void* pGadget)
+{
+    { T::bRequiresGadget } -> std::same_as<const bool&>;
+    { T::getStubSize() } -> std::convertible_to<size_t>;
+    { T::generate(pBuffer, uSyscallNumber, pGadget) } -> std::same_as<void>;
+};
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:611-617*
+
+### Required Members
+
+#### bRequiresGadget
+
+```cpp
+static constexpr bool bRequiresGadget = /* true or false */;
+```
+
+Indicates whether this policy requires syscall gadgets (e.g., `syscall; ret` sequences) to be found in ntdll.dll.
+
+#### getStubSize
+
+```cpp
+static constexpr size_t getStubSize();
+```
+
+Returns the size in bytes of each generated stub.
+
+#### generate
+
+```cpp
+static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress);
+```
+
+**Parameters:**
+- `pBuffer` - Buffer to write the stub code into
+- `uSyscallNumber` - The syscall number to embed in the stub
+- `pGadgetAddress` - Address of a syscall gadget (if `bRequiresGadget` is true)
+
+### Built-in Stub Generation Policies
+
+<AccordionGroup>
+  <Accordion title="generator::direct - Self-Contained Syscall">
+    Generates a complete, self-contained stub with an inline `syscall` instruction.
+
+    **x64 Shellcode:**
+    ```asm
+    push rcx                    ; Save rcx
+    pop r10                     ; Move to r10 (syscall convention)
+    mov eax, <syscall_number>   ; Load syscall number
+    syscall                     ; Invoke syscall
+    add rsp, 8                  ; Adjust stack
+    jmp qword ptr [rsp-8]       ; Return
+    ```
+
+    ```cpp
+    struct direct
+    {
+        static constexpr bool bRequiresGadget = false;
+        
+        inline static constinit std::array<uint8_t, 18> arrShellcode =
+        {
+            0x51,                               // push rcx
+            0x41, 0x5A,                         // pop r10
+            0xB8, 0x00, 0x00, 0x00, 0x00,       // mov eax, 0x00000000
+            0x0F, 0x05,                         // syscall
+            0x48, 0x83, 0xC4, 0x08,             // add rsp, 8
+            0xFF, 0x64, 0x24, 0xF8              // jmp qword ptr [rsp-8]
+        };
+        
+        static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* /*unused*/)
+        {
+            std::copy_n(arrShellcode.data(), arrShellcode.size(), pBuffer);
+            *reinterpret_cast<uint32_t*>(pBuffer + 4) = uSyscallNumber;
+        }
+        
+        static constexpr size_t getStubSize() { return arrShellcode.size(); }
+    };
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:309-341*
+  </Accordion>
+
+  <Accordion title="generator::gadget - Indirect Syscall (x64 only)">
+    Uses a jump to a `syscall; ret` gadget found in ntdll.dll, avoiding direct `syscall` instructions in allocated memory.
+
+    ```cpp
+    struct gadget
+    {
+        static constexpr bool bRequiresGadget = true;
+        static constexpr size_t getStubSize() { return 32; }
+        
+        static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress)
+        {
+            // mov r10, rcx
+            pBuffer[0] = 0x49;
+            pBuffer[1] = 0x89;
+            pBuffer[2] = 0xCA;
+            
+            // mov eax, syscallNumber
+            pBuffer[3] = 0xB8;
+            *reinterpret_cast<uint32_t*>(&pBuffer[4]) = uSyscallNumber;
+            
+            // mov r11, gadgetAddress
+            pBuffer[8] = 0x49;
+            pBuffer[9] = 0xBB;
+            *reinterpret_cast<uint64_t*>(&pBuffer[10]) = 
+                reinterpret_cast<uint64_t>(pGadgetAddress);
+            
+            // push r11
+            pBuffer[18] = 0x41;
+            pBuffer[19] = 0x53;
+            
+            // ret (jumps to gadget)
+            pBuffer[20] = 0xC3;
+        }
+    };
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:264-292*
+  </Accordion>
+
+  <Accordion title="generator::exception - VEH-Based Syscall">
+    Triggers an illegal instruction exception (`ud2`) to invoke the syscall through a Vectored Exception Handler.
+
+    ```cpp
+    struct exception
+    {
+        static constexpr bool bRequiresGadget = true;
+        static constexpr size_t getStubSize() { return 8; }
+        
+        static void generate(uint8_t* pBuffer, uint32_t /*unused*/, void* /*unused*/)
+        {
+            pBuffer[0] = 0x0F;  // ud2 (illegal instruction)
+            pBuffer[1] = 0x0B;
+            pBuffer[2] = 0xC3;  // ret
+            std::fill_n(pBuffer + 3, getStubSize() - 3, 0x90);  // nops
+        }
+    };
+    ```
+
+    The actual syscall is performed by the VEH handler, which modifies the exception context.
+
+    *Source: include/syscalls-cpp/syscall.hpp:296-307*
+  </Accordion>
+</AccordionGroup>
+
+### Custom Stub Generation Example
+
+Here's a real-world example of a custom stub generator that encrypts syscall numbers with multiple obfuscation layers:
+
+```cpp
+struct EncryptedShellGenerator
+{
+    static constexpr bool bRequiresGadget = false;
+    static constexpr size_t kMaxStubSize = 128;
+
+private:
+    enum class EOperationType { ADD, SUB, XOR, NOT, NEG, ROL, ROR };
+
+    struct ObfuscationLayer_t
+    {
+        EOperationType m_eType;
+        uint32_t m_uKey;
+    };
+
+public:
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* /*unused*/)
+    {
+        CBufferWriter writer(pBuffer, kMaxStubSize);
+
+        // Generate random obfuscation layers
+        std::vector<ObfuscationLayer_t> vecLayers;
+        for (int i = 0; i < iAmountOfLayers; ++i)
+        {
+            EOperationType operationType = /* random operation */;
+            uint32_t uKey = /* random key */;
+            vecLayers.push_back({ operationType, uKey });
+        }
+        
+        // Encrypt syscall number
+        uint32_t uEncryptedValue = uSyscallNumber;
+        for (auto it = vecLayers.rbegin(); it != vecLayers.rend(); ++it)
+        {
+            const auto& layer = *it;
+            switch (layer.m_eType)
+            {
+                case EOperationType::ADD: uEncryptedValue -= layer.m_uKey; break;
+                case EOperationType::SUB: uEncryptedValue += layer.m_uKey; break;
+                case EOperationType::XOR: uEncryptedValue ^= layer.m_uKey; break;
+                // ... other operations
+            }
+        }
+
+        // Generate stub
+        writer.writeBytes({ 0x51, 0x41, 0x5A });     // push rcx; pop r10
+        writer.write<uint8_t>(0xB8);                 // mov eax, ...
+        writer.write<uint32_t>(uEncryptedValue);     // ... encryptedValue
+
+        // Emit decryption layers
+        for (const auto& layer : vecLayers)
+        {
+            switch (layer.m_eType) {
+            case EOperationType::ADD:
+                writer.write<uint8_t>(0x05);         // add eax, key
+                writer.write<uint32_t>(layer.m_uKey);
+                break;
+            case EOperationType::XOR:
+                writer.write<uint8_t>(0x35);         // xor eax, key
+                writer.write<uint32_t>(layer.m_uKey);
+                break;
+            // ... other operations
+            }
+            emitJunk(writer);  // Add junk instructions
+        }
+
+        writer.writeBytes({ 0x0F, 0x05 });           // syscall
+        writer.writeBytes({ 0x48, 0x83, 0xC4, 0x08 }); // add rsp 8
+        writer.writeBytes({ 0xFF, 0x64, 0x24, 0xF8 }); // jmp qword ptr [rsp-8]
+    }
+
+    static constexpr size_t getStubSize() { return kMaxStubSize; }
+};
+```
+
+*Source: examples/custom-generator.cpp:59-169*
+
+#### Using the Custom Generator
+
+```cpp
+syscall::Manager<syscall::policies::allocator::section, 
+                 EncryptedShellGenerator> syscallManager;
+
+if (!syscallManager.initialize()) 
+{
+    std::cerr << "failed to initialize syscall manager" << std::endl;
+    return 1;
+}
+
+// Use normally
+NTSTATUS status = syscallManager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    syscall::native::getCurrentProcess(),
+    &pBaseAddress,
+    0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+*Source: examples/custom-generator.cpp:241-270*
+
+## Parsing Policies
+
+### Concept Requirements
+
+A parsing policy must satisfy the `IsSyscallParsingPolicy` concept:
+
+```cpp
+template<typename T>
+concept IsSyscallParsingPolicy = requires(const ModuleInfo_t& module)
+{
+    { T::parse(module) } -> std::convertible_to<std::vector<SyscallEntry_t>>;
+};
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:619-623*
+
+### Required Method
+
+```cpp
+static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module);
+```
+
+**Parameters:**
+- `module` - Module information structure containing PE headers and export directory
+
+**Returns:** Vector of `SyscallEntry_t` containing syscall names (hashed), numbers, and offsets
+
+### Built-in Parsing Policies
+
+<AccordionGroup>
+  <Accordion title="parser::directory - Exception/Export Directory">
+    On x64, uses the exception directory (.pdata) to determine syscall order. On x86, sorts exported Zw* functions by address.
+
+    **x64 Approach:**
+    ```cpp
+    // Use exception directory entries
+    auto pRuntimeFunctions = reinterpret_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(
+        module.m_pModuleBase + uExceptionDirRva
+    );
+    
+    // Map RVAs to export names
+    std::unordered_map<uint32_t, const char*> mapRvaToName;
+    
+    // Iterate in order, incrementing syscall numbers
+    uint32_t uSyscallNumber = 0;
+    for (DWORD i = 0; i < uFunctionCount; ++i)
+    {
+        if (it != mapRvaToName.end())
+        {
+            if (hashing::calculateHashRuntime(szName, 2) == 
+                hashing::calculateHash("Zw"))
+            {
+                // Convert Zw to Nt
+                vecFoundSyscalls.push_back({ key, uSyscallNumber, 0 });
+                uSyscallNumber++;
+            }
+        }
+    }
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:346-453*
+  </Accordion>
+
+  <Accordion title="parser::signature - Prologue Scanning">
+    Scans function prologues for the syscall number signature and includes hook detection with neighbor scanning.
+
+    **x64 Signature:** `4C 8B D1 B8 [syscall_number]`
+
+    ```cpp
+    // Check for standard prologue
+    if (*reinterpret_cast<uint32_t*>(pFunctionStart) == 0xB8D18B4C)
+    {
+        uSyscallNumber = *reinterpret_cast<uint32_t*>(pFunctionStart + 4);
+        bSyscallFound = true;
+    }
+    
+    // If hooked, search neighbors
+    if (isFunctionHooked(pFunctionStart) && !bSyscallFound)
+    {
+        // Search up to 20 functions above
+        for (int j = 1; j < 20; ++j)
+        {
+            uint8_t* pNeighborFunc = pFunctionStart - (j * 0x20);
+            if (*reinterpret_cast<uint32_t*>(pNeighborFunc) == 0xB8D18B4C)
+            {
+                uint32_t uNeighborSyscall = 
+                    *reinterpret_cast<uint32_t*>(pNeighborFunc + 4);
+                uSyscallNumber = uNeighborSyscall + j;
+                bSyscallFound = true;
+                break;
+            }
+        }
+        
+        // Search down if not found above
+        // ...
+    }
+    ```
+
+    *Source: include/syscalls-cpp/syscall.hpp:455-599*
+  </Accordion>
+</AccordionGroup>
+
+## Parser Chains
+
+You can combine multiple parsing policies into a fallback chain:
+
+```cpp
+using MyParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,    // Try first
+    syscall::policies::parser::signature,    // Fallback
+    MyCustomParser                           // Final fallback
+>;
+
+using CustomManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct,
+    MyParserChain
+>;
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:625-629*
+
+The manager will try each parser in order until one successfully returns syscalls:
+
+```cpp
+template<IsSyscallParsingPolicy CurrentParser, IsSyscallParsingPolicy... OtherParsers>
+std::vector<SyscallEntry_t> tryParseSyscalls(const ModuleInfo_t& moduleInfo)
+{
+    auto vecSyscalls = CurrentParser::parse(moduleInfo);
+
+    if (!vecSyscalls.empty())
+        return vecSyscalls;
+
+    if constexpr (sizeof...(OtherParsers) > 0)
+        return tryParseSyscalls<OtherParsers...>(moduleInfo);
+
+    return vecSyscalls;
+}
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:822-834*
+
+## Compile-Time Validation
+
+All policies are validated at compile-time with helpful error messages:
+
+```cpp
+static_assert(IsIAllocationPolicy<IAllocationPolicy>,
+    "[Syscall] The provided allocation policy is not valid. "
+    "A valid allocation policy must provide two static functions: "
+    "1. 'static bool allocate(size_t, const std::span<const uint8_t>, void*&, HANDLE&);' "
+    "2. 'static void release(void*, HANDLE);'"
+);
+
+static_assert(IsStubGenerationPolicy<IStubGenerationPolicy>,
+    "[Syscall] The provided stub generation policy is not valid. "
+    "A valid stub generation policy must provide: "
+    "1. A 'static constexpr bool bRequiresGadget' member. "
+    "2. A 'static constexpr size_t getStubSize()' function. "
+    "3. A 'static void generate(uint8_t*, uint32_t, void*)' function."
+);
+
+static_assert(IsSyscallParsingPolicy<IFirstParser> && 
+             (IsSyscallParsingPolicy<IFallbackParsers> && ...),
+    "[Syscall] One or more provided syscall parsing policies are not valid. "
+    "A valid parsing policy must provide a static function: "
+    "1. 'static std::vector<SyscallEntry_t> parse(const ModuleInfo_t&);'"
+);
+```
+
+*Source: include/syscalls-cpp/syscall.hpp:640-659*
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Basic Usage" icon="book" href="/guides/basic-usage">
+    Return to basic usage patterns and common examples
+  </Card>
+  
+  <Card title="Debugging" icon="bug" href="/guides/debugging">
+    Learn how to debug custom policies and troubleshoot issues
+  </Card>
+</CardGroup>

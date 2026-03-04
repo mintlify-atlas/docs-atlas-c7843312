@@ -1,0 +1,368 @@
+---
+title: "Manager::invoke()"
+description: "Invoke a syscall by identifier with type-safe variadic arguments"
+---
+
+## Method Signature
+
+```cpp
+template<typename Ret = uintptr_t, typename... Args>
+[[nodiscard]] SYSCALL_FORCE_INLINE Ret invoke(
+    const SyscallKey_t& syscallId,
+    Args... args
+);
+```
+
+## Description
+
+Invokes a syscall by its identifier with type-safe arguments. The method performs a binary search to locate the syscall stub, then executes it with the provided arguments.
+
+## Template Parameters
+
+<ParamField path="Ret" type="typename" default="uintptr_t">
+  The return type of the syscall.
+  
+  **Common types:**
+  - `NTSTATUS` - Windows NT status codes (most common)
+  - `HANDLE` - Handle to kernel objects
+  - `ULONG` - Unsigned long integer
+  - `uintptr_t` - Generic pointer-sized integer (default)
+  - `void` - No return value (though syscalls typically return NTSTATUS)
+  
+  **Special behavior for NTSTATUS:**
+  - Returns `STATUS_UNSUCCESSFUL` if manager is not initialized
+  - Returns `STATUS_PROCEDURE_NOT_FOUND` if syscall is not found
+</ParamField>
+
+<ParamField path="Args" type="typename...">
+  Variadic template parameters matching the syscall's argument types. Must match the exact types expected by the target syscall.
+  
+  **Example:**
+  ```cpp
+  // NtClose signature: NTSTATUS NtClose(HANDLE Handle)
+  manager.invoke<NTSTATUS>(SYSCALL_ID("NtClose"), hHandle);
+  
+  // NtAllocateVirtualMemory signature:
+  // NTSTATUS NtAllocateVirtualMemory(
+  //     HANDLE ProcessHandle,
+  //     PVOID* BaseAddress,
+  //     ULONG_PTR ZeroBits,
+  //     PSIZE_T RegionSize,
+  //     ULONG AllocationType,
+  //     ULONG Protect
+  // )
+  manager.invoke<NTSTATUS>(
+      SYSCALL_ID("NtAllocateVirtualMemory"),
+      hProcess,
+      &pBaseAddress,
+      0,
+      &regionSize,
+      MEM_COMMIT | MEM_RESERVE,
+      PAGE_READWRITE
+  );
+  ```
+</ParamField>
+
+## Parameters
+
+<ParamField path="syscallId" type="const SyscallKey_t&" required>
+  The identifier of the syscall to invoke. Must be created using the `SYSCALL_ID` macro.
+  
+  **Type notes:**
+  - With `SYSCALLS_NO_HASH` defined: `SyscallKey_t` is `std::string`
+  - Without `SYSCALLS_NO_HASH`: `SyscallKey_t` is `hashing::Hash_t` (compile-time hash)
+  
+  **Examples:**
+  ```cpp
+  SYSCALL_ID("NtClose")
+  SYSCALL_ID("NtAllocateVirtualMemory")
+  SYSCALL_ID("NtQuerySystemInformation")
+  ```
+</ParamField>
+
+<ParamField path="args" type="Args...">
+  The arguments to pass to the syscall. Must match the syscall's expected parameter types and count.
+  
+  Arguments are perfectly forwarded to the syscall stub:
+  ```cpp
+  return reinterpret_cast<Function_t>(pStubAddress)(std::forward<Args>(args)...);
+  ```
+</ParamField>
+
+## Return Value
+
+<ResponseField name="Ret" type="Ret">
+  Returns a value of type `Ret` (specified as template parameter).
+  
+  **Special return values when `Ret` is `NTSTATUS`:**
+  
+  - `STATUS_UNSUCCESSFUL` - Manager failed to initialize automatically
+  - `STATUS_PROCEDURE_NOT_FOUND` - Syscall identifier not found in parsed syscalls
+  
+  **Default-constructed value** (for non-NTSTATUS types):
+  - Returned if initialization fails or syscall is not found
+  - For pointer types: `nullptr`
+  - For integer types: `0`
+  - For custom types: default constructor result
+  
+  **Successful invocation:**
+  - Returns the actual result from the syscall execution
+</ResponseField>
+
+## Behavior Details
+
+### Automatic Initialization
+
+If the manager is not initialized, `invoke()` automatically calls `initialize()`:
+
+```cpp
+if (!m_bInitialized)
+{
+    if (!initialize())
+    {
+        // Return error based on return type
+        if constexpr (std::is_same_v<Ret, NTSTATUS>)
+            return native::STATUS_UNSUCCESSFUL;
+        return Ret{};
+    }
+}
+```
+
+This allows lazy initialization, but explicit initialization is recommended for better error handling.
+
+### Syscall Lookup
+
+Uses binary search to locate the syscall stub:
+
+```cpp
+auto it = std::ranges::lower_bound(
+    m_vecParsedSyscalls,
+    syscallId,
+    std::less{},
+    &SyscallEntry_t::m_key
+);
+```
+
+Time complexity: O(log n) where n is the number of parsed syscalls.
+
+### Stub Execution
+
+Depending on the stub generation policy:
+
+1. **Direct Policy** (`policies::generator::direct`)
+   - Executes syscall stub directly
+   - No additional setup required
+
+2. **Gadget Policy** (`policies::generator::gadget`)
+   - Selects a random gadget from the pool
+   - Executes syscall via the gadget
+
+3. **Exception Policy** (`policies::generator::exception`)
+   - Sets up exception context guard
+   - Selects a random gadget (Windows x64) or uses KiFastSystemCall (Windows x86)
+   - Executes syscall via exception handler
+
+### Inlining
+
+The method is marked `SYSCALL_FORCE_INLINE` to minimize call overhead. The compiler will attempt to inline the entire invocation path for optimal performance.
+
+## Thread Safety
+
+Once initialized, `invoke()` is thread-safe without additional locking:
+- The syscall vector is read-only after initialization
+- Random gadget selection uses thread-safe `rdtscp()` instruction
+- Exception context guards use thread-local storage
+
+Multiple threads can safely invoke syscalls concurrently.
+
+## Examples
+
+### Basic Syscall Invocation
+
+```cpp
+SyscallSectionDirect manager;
+manager.initialize();
+
+// Close a handle
+HANDLE hFile = CreateFileW(L"test.txt", ...);
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hFile
+);
+
+if (NT_SUCCESS(status))
+{
+    std::cout << "Handle closed successfully" << std::endl;
+}
+```
+
+### Memory Allocation
+
+```cpp
+SyscallHeapGadget manager;
+
+PVOID pBaseAddress = nullptr;
+SIZE_T regionSize = 0x1000;
+
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    GetCurrentProcess(),
+    &pBaseAddress,
+    0,
+    &regionSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+
+if (NT_SUCCESS(status))
+{
+    std::cout << "Allocated memory at: " << pBaseAddress << std::endl;
+}
+```
+
+### Query System Information
+
+```cpp
+SyscallSectionGadget manager;
+
+SYSTEM_BASIC_INFORMATION sbi{};
+ULONG returnLength = 0;
+
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtQuerySystemInformation"),
+    SystemBasicInformation,
+    &sbi,
+    sizeof(sbi),
+    &returnLength
+);
+
+if (NT_SUCCESS(status))
+{
+    std::cout << "Number of processors: " << sbi.NumberOfProcessors << std::endl;
+}
+```
+
+### Error Handling
+
+```cpp
+SyscallSectionDirect manager;
+
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+
+if (status == STATUS_UNSUCCESSFUL)
+{
+    std::cerr << "Failed to initialize syscall manager" << std::endl;
+}
+else if (status == STATUS_PROCEDURE_NOT_FOUND)
+{
+    std::cerr << "Syscall not found in parsed modules" << std::endl;
+}
+else if (!NT_SUCCESS(status))
+{
+    std::cerr << "Syscall failed with status: 0x" 
+              << std::hex << status << std::endl;
+}
+else
+{
+    std::cout << "Syscall succeeded" << std::endl;
+}
+```
+
+### Template Type Deduction
+
+```cpp
+SyscallSectionDirect manager;
+
+// Explicit return type (recommended)
+auto status1 = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+
+// Default return type (uintptr_t)
+auto result = manager.invoke(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+// result is uintptr_t
+
+// Custom return type
+auto hProcess = manager.invoke<HANDLE>(
+    SYSCALL_ID("NtOpenProcess"),
+    &hProcessHandle,
+    PROCESS_ALL_ACCESS,
+    &objAttr,
+    &clientId
+);
+```
+
+## Performance Considerations
+
+- **Binary search:** O(log n) lookup time, very fast even with hundreds of syscalls
+- **Inlining:** Compiler will inline the method for minimal overhead
+- **Randomization:** Random gadget selection uses fast `rdtscp()` instruction
+- **No locks:** Once initialized, no synchronization overhead during invocation
+
+## Common Pitfalls
+
+### Incorrect Argument Types
+
+```cpp
+// WRONG: Passing int instead of HANDLE
+manager.invoke<NTSTATUS>(SYSCALL_ID("NtClose"), 123);
+
+// CORRECT: Use proper HANDLE type
+HANDLE hHandle = ...;
+manager.invoke<NTSTATUS>(SYSCALL_ID("NtClose"), hHandle);
+```
+
+### Missing Pointer Arguments
+
+```cpp
+// WRONG: Passing value instead of pointer
+SIZE_T regionSize = 0x1000;
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    hProcess,
+    baseAddress,  // Should be &baseAddress
+    0,
+    regionSize,   // Should be &regionSize
+    MEM_COMMIT,
+    PAGE_READWRITE
+);
+
+// CORRECT: Use address-of operator
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    hProcess,
+    &baseAddress,
+    0,
+    &regionSize,
+    MEM_COMMIT,
+    PAGE_READWRITE
+);
+```
+
+### Not Checking Return Status
+
+```cpp
+// WRONG: Ignoring return status
+manager.invoke<NTSTATUS>(SYSCALL_ID("NtClose"), hHandle);
+
+// CORRECT: Always check status
+auto status = manager.invoke<NTSTATUS>(SYSCALL_ID("NtClose"), hHandle);
+if (!NT_SUCCESS(status))
+{
+    // Handle error
+}
+```
+
+## See Also
+
+- [Manager Overview](/api/manager) - Complete Manager class documentation
+- [Manager Initialization](/api/manager-initialization) - Details on the `initialize()` method
+- [SYSCALL_ID Macro](/api/macros#syscall-id) - How to create syscall identifiers
+- [NT Status Codes](/api/types#ntstatus) - Windows NT status code reference

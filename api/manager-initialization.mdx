@@ -1,0 +1,217 @@
+---
+title: "Manager::initialize()"
+description: "Initialize the syscall manager and parse syscalls from specified Windows modules"
+---
+
+## Method Signature
+
+```cpp
+[[nodiscard]] bool initialize(
+    const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") }
+);
+```
+
+## Description
+
+Initializes the syscall manager by parsing syscall numbers from specified Windows modules and generating syscall stubs. This method must be called before invoking any syscalls, though `invoke()` will automatically call it if not already initialized.
+
+## Parameters
+
+<ParamField path="vecModuleKeys" type="const std::vector<SyscallKey_t>&">
+  A vector of module identifiers to parse for syscalls. Each module key should be created using the `SYSCALL_ID` macro.
+  
+  **Default behavior:** Parses syscalls from `ntdll.dll` only.
+  
+  **Type notes:**
+  - With `SYSCALLS_NO_HASH` defined: `SyscallKey_t` is `std::string`
+  - Without `SYSCALLS_NO_HASH`: `SyscallKey_t` is `hashing::Hash_t` (compile-time hash)
+  
+  **Examples:**
+  ```cpp
+  // Single module (default)
+  manager.initialize();
+  
+  // Multiple modules
+  manager.initialize({
+      SYSCALL_ID("ntdll.dll"),
+      SYSCALL_ID("win32u.dll")
+  });
+  ```
+</ParamField>
+
+## Return Value
+
+<ResponseField name="bool" type="bool">
+  Returns `true` if initialization succeeds, `false` otherwise.
+  
+  **Success conditions:**
+  - At least one module is successfully loaded
+  - At least one syscall is successfully parsed
+  - Syscall stubs are successfully generated
+  - Memory allocation succeeds
+  - Exception handler registration succeeds (if using exception policy)
+  
+  **Failure conditions:**
+  - All specified modules fail to load
+  - No syscalls are parsed from any module
+  - Memory allocation fails
+  - Syscall gadgets not found (when using gadget-based policies on Windows x64)
+  - Exception handler registration fails (when using exception policy)
+</ResponseField>
+
+## Behavior Details
+
+### Idempotency
+
+The method is idempotent - if already initialized, it returns `true` immediately without re-initializing:
+
+```cpp
+if (m_bInitialized)
+    return true;
+```
+
+### Initialization Process
+
+1. **Gadget Search** (Windows x64, if `StubPolicy::bRequiresGadget` is true)
+   - Searches the `.text` section of `ntdll.dll` for syscall gadgets (`0x0F 0x05 0xC3`)
+   - Returns `false` if no gadgets are found
+
+2. **Module Parsing**
+   - Iterates through each module key in `vecModuleKeys`
+   - Loads module information (base address, PE headers, export directory)
+   - Attempts to parse syscalls using the parser chain (primary parser, then fallback parsers)
+   - Continues to next module if current module fails to load
+
+3. **Syscall Randomization**
+   - Randomizes the order of parsed syscalls using Fisher-Yates shuffle with `rdtscp()` for entropy
+   - Assigns offsets to each syscall based on stub size
+
+4. **Syscall Sorting**
+   - Sorts syscalls by key for efficient binary search during invocation
+
+5. **Stub Generation**
+   - Allocates temporary buffer for all stubs
+   - Generates individual syscall stubs based on `StubPolicy`
+   - Assigns random gadgets to each stub (if applicable)
+
+6. **Memory Allocation**
+   - Allocates executable memory using `AllocPolicy`
+   - Copies generated stubs to allocated region
+
+7. **Exception Handler Setup** (if using `policies::generator::exception`)
+   - Registers vectored exception handler
+   - Returns `false` if registration fails
+
+## Thread Safety
+
+The method is thread-safe:
+
+```cpp
+std::lock_guard<std::mutex> lock(m_mutex);
+```
+
+Multiple threads can safely call `initialize()` concurrently. The first thread to acquire the lock will perform initialization, and subsequent calls (even those waiting on the lock) will return `true` immediately due to the double-checked locking pattern.
+
+## Examples
+
+### Basic Initialization
+
+```cpp
+SyscallSectionDirect manager;
+
+if (!manager.initialize())
+{
+    std::cerr << "Failed to initialize syscall manager" << std::endl;
+    return 1;
+}
+
+std::cout << "Syscall manager initialized successfully" << std::endl;
+```
+
+### Multi-Module Initialization
+
+```cpp
+SyscallSectionDirect manager;
+
+std::vector<SyscallKey_t> modules = {
+    SYSCALL_ID("ntdll.dll"),
+    SYSCALL_ID("win32u.dll")
+};
+
+if (!manager.initialize(modules))
+{
+    std::cerr << "Failed to parse syscalls from specified modules" << std::endl;
+    return 1;
+}
+```
+
+### Explicit Initialization with Error Handling
+
+```cpp
+SyscallHeapGadget manager;
+
+// Initialize before use to handle errors explicitly
+if (!manager.initialize())
+{
+    // Could fail due to:
+    // - Module not found
+    // - No syscalls parsed
+    // - Gadgets not found
+    // - Memory allocation failure
+    std::cerr << "Initialization failed" << std::endl;
+    return 1;
+}
+
+// Safe to invoke syscalls now
+auto status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+```
+
+### Lazy Initialization
+
+```cpp
+SyscallSectionDirect manager;
+
+// No explicit initialization needed
+// invoke() will call initialize() automatically
+auto status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+
+if (status == STATUS_UNSUCCESSFUL)
+{
+    // Could indicate initialization failure
+    std::cerr << "Syscall invocation failed" << std::endl;
+}
+```
+
+## Platform-Specific Notes
+
+### Windows x64
+
+When using gadget-based stub policies (`policies::generator::gadget` or `policies::generator::exception`):
+- Automatically searches for syscall gadgets in `ntdll.dll`
+- Initialization fails if no gadgets are found
+- Uses `rdtscp()` instruction for secure randomization
+
+### Windows x86
+
+When using exception policy:
+- Uses `__readfsdword(0xC0)` for gadget address (KiFastSystemCall)
+- No gadget search required
+
+## Performance Considerations
+
+- Initialization involves parsing PE headers and export tables, which can be relatively expensive
+- Consider calling `initialize()` during application startup rather than on first syscall
+- Once initialized, the manager can be reused for the lifetime of the application
+- The randomization and sorting steps add minimal overhead during initialization
+
+## See Also
+
+- [Manager Overview](/api/manager) - Complete Manager class documentation
+- [Manager Invocation](/api/manager-invocation) - Details on the `invoke()` method
+- [SYSCALL_ID Macro](/api/macros#syscall-id) - How to create syscall identifiers

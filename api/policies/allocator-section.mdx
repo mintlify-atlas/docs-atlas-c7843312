@@ -1,0 +1,202 @@
+---
+title: allocator::section
+description: Memory allocation using NtCreateSection with SEC_NO_CHANGE flag for immutable syscall stubs
+---
+
+## Overview
+
+The `allocator::section` policy allocates memory for syscall stubs using `NtCreateSection` with the `SEC_NO_CHANGE` flag. This creates an immutable memory region that cannot be modified after initial mapping, providing strong protection against runtime patching.
+
+## Method Signatures
+
+<ParamField path="allocate" type="static bool">
+  Allocates an immutable section for syscall stubs
+  
+  ```cpp
+  static bool allocate(
+      size_t uRegionSize,
+      const std::span<const uint8_t> vecBuffer,
+      void*& pOutRegion,
+      HANDLE& unused
+  )
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="uRegionSize" type="size_t" required>
+      Size of the region to allocate in bytes
+    </ParamField>
+    <ParamField path="vecBuffer" type="const std::span<const uint8_t>" required>
+      Buffer containing the syscall stubs to copy into the section
+    </ParamField>
+    <ParamField path="pOutRegion" type="void*&" required>
+      Output parameter receiving the base address of the executable mapping
+    </ParamField>
+    <ParamField path="unused" type="HANDLE&">
+      Unused for this policy (section handle is closed before return)
+    </ParamField>
+  </Expandable>
+  
+  <ResponseField name="return" type="bool">
+    Returns `true` on successful allocation, `false` on failure
+  </ResponseField>
+</ParamField>
+
+<ParamField path="release" type="static void">
+  Releases the section mapping
+  
+  ```cpp
+  static void release(void* pRegion, HANDLE /*hHeapHandle*/)
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="pRegion" type="void*" required>
+      Base address of the region to unmap
+    </ParamField>
+    <ParamField path="hHeapHandle" type="HANDLE">
+      Unused for this policy
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Implementation Details
+
+The allocation process involves multiple steps:
+
+1. Create a section object with `SEC_NO_CHANGE | SEC_COMMIT` attributes
+2. Map the section with `PAGE_READWRITE` permissions
+3. Copy the syscall stubs into the writable mapping
+4. Unmap the writable view
+5. Remap the section with `PAGE_EXECUTE_READ` permissions
+6. Close the section handle
+
+<Info>
+The `SEC_NO_CHANGE` flag is the key security feature—it prevents any further modifications to the section, even from kernel mode.
+</Info>
+
+## Source Code
+
+From `syscall.hpp:115-165`:
+
+```cpp
+struct section
+{
+    static bool allocate(size_t uRegionSize, const std::span<const uint8_t> vecBuffer, 
+                        void*& pOutRegion, HANDLE& /*unused*/)
+    {
+        HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+
+        auto fNtCreateSection = reinterpret_cast<native::NtCreateSection_t>(
+            native::getExportAddress(hNtDll, SYSCALL_ID("NtCreateSection")));
+        auto fNtMapView = reinterpret_cast<native::NtMapViewOfSection_t>(
+            native::getExportAddress(hNtDll, SYSCALL_ID("NtMapViewOfSection")));
+        auto fNtUnmapView = reinterpret_cast<native::NtUnmapViewOfSection_t>(
+            native::getExportAddress(hNtDll, SYSCALL_ID("NtUnmapViewOfSection")));
+        auto fNtClose = reinterpret_cast<native::NtClose_t>(
+            native::getExportAddress(hNtDll, SYSCALL_ID("NtClose")));
+            
+        if (!fNtCreateSection || !fNtMapView || !fNtUnmapView || !fNtClose)
+            return false;
+
+        HANDLE hSectionHandle = nullptr;
+        LARGE_INTEGER sectionSize;
+        sectionSize.QuadPart = uRegionSize;
+
+        NTSTATUS status = fNtCreateSection(
+            &hSectionHandle, SECTION_ALL_ACCESS, nullptr, &sectionSize,
+            PAGE_EXECUTE_READWRITE, 
+            SEC_COMMIT | static_cast<ULONG>(SECTION_NO_CHANGE), 
+            nullptr
+        );
+        if (!NT_SUCCESS(status))
+            return false;
+
+        // Map as writable, copy data, remap as executable
+        void* pTempView = nullptr;
+        SIZE_T uViewSize = uRegionSize;
+        status = fNtMapView(hSectionHandle, native::getCurrentProcess(), 
+                           &pTempView, 0, 0, nullptr, &uViewSize, 
+                           VIEW_SHARE, 0, PAGE_READWRITE);
+        if (!NT_SUCCESS(status)) {
+            fNtClose(hSectionHandle);
+            return false;
+        }
+
+        std::copy_n(vecBuffer.data(), uRegionSize, static_cast<uint8_t*>(pTempView));
+        fNtUnmapView(native::getCurrentProcess(), pTempView);
+        
+        uViewSize = uRegionSize;
+        status = fNtMapView(hSectionHandle, native::getCurrentProcess(), 
+                           &pOutRegion, 0, 0, nullptr, &uViewSize,
+                           VIEW_SHARE, 0, PAGE_EXECUTE_READ);
+        fNtClose(hSectionHandle);
+        return NT_SUCCESS(status) && pOutRegion;
+    }
+
+    static void release(void* pRegion, HANDLE /*hHeapHandle*/)
+    {
+        if (pRegion) {
+            HMODULE hNtDll = native::getModuleBase(hashing::calculateHash("ntdll.dll"));
+            auto fNtUnmapView = reinterpret_cast<native::NtUnmapViewOfSection_t>(
+                native::getExportAddress(hNtDll, SYSCALL_ID("NtUnmapViewOfSection")));
+            if (fNtUnmapView)
+                fNtUnmapView(native::getCurrentProcess(), pRegion);
+        }
+    }
+};
+```
+
+## Usage Example
+
+```cpp
+#include <syscalls-cpp/syscall.hpp>
+
+// Use the pre-defined type alias
+SyscallSectionDirect syscallManager;
+if (!syscallManager.initialize()) {
+    std::cerr << "Failed to initialize with section allocator\n";
+    return 1;
+}
+
+// Or compose manually
+using CustomManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct
+>;
+
+CustomManager manager;
+manager.initialize();
+```
+
+## Security Properties
+
+<CardGroup cols={2}>
+  <Card title="Immutability" icon="lock">
+    Once mapped as executable, the section cannot be modified—not even by kernel-mode code. This prevents runtime patching of syscall stubs.
+  </Card>
+  <Card title="Protection Demo" icon="shield">
+    Attempts to patch syscalls in SEC_NO_CHANGE sections fail, as demonstrated in the library's protection demo.
+  </Card>
+</CardGroup>
+
+## Trade-offs
+
+| Aspect | Description |
+|--------|-------------|
+| **Security** | Highest—immutable after mapping |
+| **Performance** | Slightly slower allocation (multiple map operations) |
+| **Complexity** | Most complex allocation process |
+| **Compatibility** | Requires Windows NT 6.0+ |
+
+## See Also
+
+<CardGroup cols={3}>
+  <Card title="allocator::heap" href="/api/policies/allocator-heap">
+    Heap-based allocation alternative
+  </Card>
+  <Card title="allocator::memory" href="/api/policies/allocator-memory">
+    Virtual memory allocation alternative
+  </Card>
+  <Card title="Policy Composition" href="/core-concepts/policy-composition">
+    Learn how to combine policies
+  </Card>
+</CardGroup>

@@ -1,0 +1,223 @@
+---
+title: "Gadget Syscalls"
+description: "Learn how to use syscall; ret gadgets from ntdll.dll for stealthier system call invocation"
+---
+
+## Overview
+
+The `generator::gadget` policy uses `syscall; ret` gadgets found in ntdll.dll's .text section. Instead of executing the syscall instruction from your own code, it redirects execution to legitimate syscall instructions within ntdll.dll.
+
+<Note>
+This generator is **x64 only**. It is not available on x86 platforms.
+</Note>
+
+## How It Works
+
+The gadget generator:
+
+1. **Initialization Phase**: Scans ntdll.dll's `.text` section for byte pattern `0x0F 0x05 0xC3` (syscall; ret)
+2. **Stub Generation**: Creates a stub that loads the syscall number and jumps to a random gadget
+3. **Execution**: The syscall executes from within ntdll.dll, making it appear legitimate
+
+### Generated Stub
+
+```asm
+mov r10, rcx                ; Move first arg to r10
+mov eax, <syscall_number>   ; Load syscall number
+mov r11, <gadget_address>   ; Load random gadget address
+push r11                    ; Push gadget to stack
+ret                         ; Return to gadget (executes syscall; ret)
+```
+
+The stub is 21 bytes on x64 (32 bytes with padding).
+
+## Complete Example
+
+```cpp
+#include <iostream>
+#include <syscalls-cpp/syscall.hpp>
+
+int main() 
+{
+    // Create syscall manager with gadget generator (x64 only)
+    syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::gadget
+    > syscallManager;
+    
+    if (!syscallManager.initialize())
+    {
+        std::cerr << "initialization failed!\n";
+        return 1;
+    }
+
+    std::cout << "syscall manager initialized with gadgets" << std::endl;
+
+    // Allocate virtual memory using gadget-based syscalls
+    PVOID pBaseAddress = nullptr;
+    SIZE_T uSize = 0x1000;
+
+    NTSTATUS status = syscallManager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        syscall::native::getCurrentProcess(),
+        &pBaseAddress,
+        0, &uSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+
+    if (pBaseAddress)
+        std::cout << "allocation successful at 0x" << pBaseAddress << std::endl;
+    else
+        std::cerr << "allocation failed, status: 0x" << std::hex << status << std::endl;
+
+    return 0;
+}
+```
+
+## Gadget Discovery
+
+During initialization, the manager searches ntdll.dll for gadgets:
+
+```cpp
+bool findSyscallGadgets()
+{
+    // Get ntdll.dll module info
+    ModuleInfo_t ntdll;
+    if (!getModuleInfo(SYSCALL_ID("ntdll.dll"), ntdll))
+        return false;
+
+    // Locate .text section
+    IMAGE_SECTION_HEADER* pSections = IMAGE_FIRST_SECTION(ntdll.m_pNtHeaders);
+    uint8_t* pTextSection = nullptr;
+    uint32_t uTextSectionSize = 0;
+    
+    // ... find .text section ...
+
+    // Scan for syscall; ret pattern (0x0F 0x05 0xC3)
+    m_vecSyscallGadgets.clear();
+    for (DWORD i = 0; i < uTextSectionSize - 2; ++i)
+        if (pTextSection[i] == 0x0F && 
+            pTextSection[i + 1] == 0x05 && 
+            pTextSection[i + 2] == 0xC3)
+            m_vecSyscallGadgets.push_back(&pTextSection[i]);
+
+    return !m_vecSyscallGadgets.empty();
+}
+```
+
+Typically, hundreds of gadgets are found in ntdll.dll.
+
+## Random Gadget Selection
+
+Each syscall stub is assigned a random gadget during stub generation:
+
+```cpp
+const size_t uRandomIndex = native::rdtscp() % uGadgetsCount;
+pGadgetForStub = m_vecSyscallGadgets[uRandomIndex];
+```
+
+This randomization provides additional diversity and makes pattern detection harder.
+
+## Security Benefits
+
+<AccordionGroup>
+  <Accordion title="Call Stack Legitimacy">
+    When EDR/AV inspects the call stack during syscall execution, it sees the syscall originating from ntdll.dll's .text section - exactly where legitimate syscalls should come from.
+  </Accordion>
+
+  <Accordion title="Return Address Validation">
+    Many security products validate that syscalls return to legitimate code. With gadgets, the return address points to your stub, but the syscall itself executes from ntdll.dll.
+  </Accordion>
+
+  <Accordion title="Memory Region Analysis">
+    Security tools that flag syscalls from unusual memory regions (heap, private memory, etc.) won't trigger since the syscall instruction is in ntdll.dll's .text section.
+  </Accordion>
+
+  <Accordion title="Pattern Diversity">
+    Using multiple random gadgets makes it harder to establish a detection pattern compared to always using the same syscall location.
+  </Accordion>
+</AccordionGroup>
+
+## Generator Policy Details
+
+The `generator::gadget` policy implementation:
+
+```cpp
+struct gadget
+{
+    static constexpr bool bRequiresGadget = true;
+    static constexpr size_t getStubSize() { return 32; }
+    
+    static void generate(uint8_t* pBuffer, uint32_t uSyscallNumber, void* pGadgetAddress)
+    {
+        // mov r10, rcx
+        pBuffer[0] = 0x49;
+        pBuffer[1] = 0x89;
+        pBuffer[2] = 0xCA;
+
+        // mov eax, syscall_number
+        pBuffer[3] = 0xB8;
+        *reinterpret_cast<uint32_t*>(&pBuffer[4]) = uSyscallNumber;
+
+        // mov r11, gadget_address
+        pBuffer[8] = 0x49;
+        pBuffer[9] = 0xBB;
+        *reinterpret_cast<uint64_t*>(&pBuffer[10]) = reinterpret_cast<uint64_t>(pGadgetAddress);
+
+        // push r11
+        pBuffer[18] = 0x41;
+        pBuffer[19] = 0x53;
+
+        // ret
+        pBuffer[20] = 0xC3;
+    }
+};
+```
+
+## Use Cases
+
+- **Security Research**: Bypassing call stack-based detections
+- **Red Team Operations**: More stealthy syscall execution
+- **EDR Testing**: Validating security product effectiveness
+- **Malware Analysis**: Understanding evasion techniques
+
+## Limitations
+
+<Warning>
+**Platform Support**: Only works on x64 Windows. The x86 version uses different calling conventions and syscall mechanisms.
+
+**Initialization Overhead**: Must scan ntdll.dll's .text section to find gadgets during initialization.
+
+**Slight Performance Cost**: The stub uses indirect jumps which are slightly slower than direct syscalls.
+</Warning>
+
+## Performance Considerations
+
+- **Initialization**: ~1-5ms to scan and catalog gadgets
+- **Per-Call Overhead**: ~5-10 extra CPU cycles due to indirect jump
+- **Memory Usage**: Stores pointers to all discovered gadgets (typically 2-8KB)
+
+## Expected Output
+
+```bash
+$ ./gadget-example.exe
+syscall manager initialized with gadgets
+allocation successful at 0x000001F2A3B4C000
+```
+
+## Comparison with Direct Syscalls
+
+| Feature | Direct | Gadget |
+|---------|--------|--------|
+| Platform | x64 + x86 | x64 only |
+| Performance | Fastest | Slight overhead |
+| Stealth | Low | High |
+| Complexity | Simple | Moderate |
+| Initialization | Instant | ~1-5ms |
+
+## See Also
+
+- [Direct Syscalls](/examples/direct-syscalls) - Simpler, faster approach
+- [Exception Syscalls](/examples/exception-syscalls) - VEH-based alternative
+- [Architecture Overview](/core-concepts/architecture) - Understanding the framework

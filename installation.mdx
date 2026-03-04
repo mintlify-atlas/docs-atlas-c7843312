@@ -1,0 +1,203 @@
+---
+title: Installation
+description: Install syscalls-cpp using vcpkg, Conan, or manual setup
+---
+
+## Requirements
+
+Before installing syscalls-cpp, ensure your development environment meets these requirements:
+
+<AccordionGroup>
+  <Accordion title="C++20 Compiler" icon="code">
+    - **MSVC**: Visual Studio 2019 16.11 or later
+    - **Clang**: Version 10 or later
+    - **GCC**: Version 10 or later
+  </Accordion>
+  <Accordion title="Platform" icon="windows">
+    - **Windows x86**: 32-bit Windows targets
+    - **Windows x64**: 64-bit Windows targets
+    
+    <Note>
+      Linux and macOS are not supported as syscalls-cpp is Windows-specific.
+    </Note>
+  </Accordion>
+  <Accordion title="Build System" icon="gear">
+    - **CMake**: Version 3.15 or later (recommended)
+    - **MSBuild**: Integrated with Visual Studio
+  </Accordion>
+</AccordionGroup>
+
+## vcpkg (Recommended)
+
+The recommended method to install syscalls-cpp is through [vcpkg](https://vcpkg.io/), Microsoft's C++ package manager.
+
+<Steps>
+  <Step title="Install vcpkg">
+    If you haven't already, clone and bootstrap vcpkg:
+    
+    ```bash
+    git clone https://github.com/Microsoft/vcpkg.git
+    cd vcpkg
+    .\bootstrap-vcpkg.bat
+    ```
+  </Step>
+  
+  <Step title="Install syscalls-cpp">
+    Run the following command to install the library:
+    
+    ```bash
+    vcpkg install syscalls-cpp
+    ```
+    
+    This will download, build, and install syscalls-cpp with automatic integration for MSBuild and CMake projects.
+  </Step>
+  
+  <Step title="Integrate with your project">
+    For CMake projects, use the vcpkg toolchain file:
+    
+    ```bash
+    cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[vcpkg root]/scripts/buildsystems/vcpkg.cmake
+    ```
+    
+    For MSBuild, vcpkg integrates automatically after running:
+    
+    ```bash
+    vcpkg integrate install
+    ```
+  </Step>
+</Steps>
+
+## Conan
+
+Alternatively, you can use [Conan](https://conan.io/) for package management.
+
+<Steps>
+  <Step title="Add dependency">
+    Create or update your `conanfile.txt`:
+    
+    ```ini conanfile.txt
+    [requires]
+    syscalls-cpp/1.2.0
+    
+    [generators]
+    cmake
+    ```
+  </Step>
+  
+  <Step title="Install dependencies">
+    Run Conan to install the package:
+    
+    ```bash
+    conan install . --build=missing
+    ```
+  </Step>
+  
+  <Step title="Configure CMake">
+    In your `CMakeLists.txt`, include the Conan-generated files:
+    
+    ```cmake CMakeLists.txt
+    include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
+    conan_basic_setup()
+    
+    target_link_libraries(your_target ${CONAN_LIBS})
+    ```
+  </Step>
+</Steps>
+
+## Manual Installation
+
+For manual setup without a package manager:
+
+<Steps>
+  <Step title="Clone the repository">
+    Clone the syscalls-cpp repository:
+    
+    ```bash
+    git clone https://github.com/sapdragon/syscalls-cpp.git
+    cd syscalls-cpp
+    ```
+  </Step>
+  
+  <Step title="Copy headers">
+    Since syscalls-cpp is header-only, copy the `include` directory to your project:
+    
+    ```bash
+    # Copy to your project's include path
+    xcopy /E /I include\syscalls-cpp C:\your-project\include\syscalls-cpp
+    ```
+  </Step>
+  
+  <Step title="Configure include paths">
+    Add the include directory to your compiler's include path.
+    
+    **For CMake:**
+    ```cmake CMakeLists.txt
+    target_include_directories(your_target PRIVATE
+        "${CMAKE_SOURCE_DIR}/include"
+    )
+    ```
+    
+    **For MSVC:**
+    - Project Properties → C/C++ → General → Additional Include Directories
+    - Add the path to the `include` folder
+  </Step>
+  
+  <Step title="Enable C++20">
+    Ensure your project uses C++20 standard.
+    
+    **CMake:**
+    ```cmake
+    target_compile_features(your_target PRIVATE cxx_std_20)
+    ```
+    
+    **MSVC:**
+    - Project Properties → C/C++ → Language → C++ Language Standard
+    - Select "ISO C++20 Standard (/std:c++20)"
+  </Step>
+</Steps>
+
+## Verification
+
+To verify your installation, create a simple test file:
+
+```cpp test.cpp
+#include <iostream>
+#include <syscalls-cpp/syscall.hpp>
+
+int main() {
+    syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::direct
+    > manager;
+    
+    if (manager.initialize()) {
+        std::cout << "syscalls-cpp initialized successfully!" << std::endl;
+        return 0;
+    }
+    
+    std::cerr << "Initialization failed" << std::endl;
+    return 1;
+}
+```
+
+Compile and run this program. If it prints "syscalls-cpp initialized successfully!", your installation is complete.
+
+## Platform Compatibility Notes
+
+<Warning>
+  Some policies are platform-specific:
+  - `generator::gadget` is only available on x64 Windows
+  - The `parser::directory` policy uses different methods for x86 (sorted exports) vs x64 (exception directory)
+</Warning>
+
+<Note>
+  For debugging purposes, you can disable compile-time hashing by defining `SYSCALLS_NO_HASH`:
+  - **MSVC**: Add `/DSYSCALLS_NO_HASH` to compiler flags
+  - **GCC/Clang**: Add `-DSYSCALLS_NO_HASH` to compiler flags
+</Note>
+
+## Next Steps
+
+<Card title="Quick Start" icon="rocket" href="/quickstart">
+  Follow our quick start guide to build your first syscall manager
+</Card>

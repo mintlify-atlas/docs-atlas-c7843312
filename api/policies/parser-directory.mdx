@@ -1,0 +1,252 @@
+---
+title: parser::directory
+description: Syscall number resolution using exception directory (x64) or sorted exports (x86)
+---
+
+## Overview
+
+The `parser::directory` policy resolves syscall numbers by analyzing ntdll.dll's metadata structures. On x64, it uses the exception directory (.pdata) mapped to the export table. On x86, it sorts Zw* functions by their memory addresses.
+
+## Method Signature
+
+<ParamField path="parse" type="static std::vector<SyscallEntry_t>">
+  Parses a module to extract syscall numbers
+  
+  ```cpp
+  static std::vector<SyscallEntry_t> parse(const ModuleInfo_t& module)
+  ```
+  
+  <Expandable title="Parameters">
+    <ParamField path="module" type="const ModuleInfo_t&" required>
+      Module information structure containing base address, NT headers, and export directory
+    </ParamField>
+  </Expandable>
+  
+  <ResponseField name="return" type="std::vector<SyscallEntry_t>">
+    Vector of syscall entries with keys, syscall numbers, and offsets
+  </ResponseField>
+</ParamField>
+
+## Implementation
+
+### x64: Exception Directory Method
+
+From `syscall.hpp:348-401`:
+
+```cpp
+if constexpr (platform::isWindows64)
+{
+    auto uExceptionDirRva = module.m_pNtHeaders->OptionalHeader
+        .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+    if (!uExceptionDirRva)
+        return vecFoundSyscalls;
+
+    auto pRuntimeFunctions = reinterpret_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(
+        module.m_pModuleBase + uExceptionDirRva);
+    auto uExceptionDirSize = module.m_pNtHeaders->OptionalHeader
+        .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+    auto uFunctionCount = uExceptionDirSize / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+
+    auto pFunctionsRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+    auto pNamesRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+    auto pOrdinalsRva = reinterpret_cast<uint16_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+    // Build RVA -> Name mapping
+    std::unordered_map<uint32_t, const char*> mapRvaToName;
+    for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; ++i)
+    {
+        const char* szName = reinterpret_cast<const char*>(
+            module.m_pModuleBase + pNamesRVA[i]);
+        uint16_t uOrdinal = pOrdinalsRva[i];
+        uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+        mapRvaToName[uFunctionRva] = szName;
+    }
+
+    // Iterate exception directory in order
+    uint32_t uSyscallNumber = 0;
+    for (DWORD i = 0; i < uFunctionCount; ++i)
+    {
+        auto pFunction = &pRuntimeFunctions[i];
+        if (pFunction->BeginAddress == 0)
+            break;
+
+        auto it = mapRvaToName.find(pFunction->BeginAddress);
+        if (it != mapRvaToName.end())
+        {
+            const char* szName = it->second;
+            // Check if name starts with "Zw"
+            if (hashing::calculateHashRuntime(szName, 2) == hashing::calculateHash("Zw"))
+            {
+                // Convert Zw* to Nt*
+                char szNtName[128];
+                std::copy_n(szName, sizeof(szNtName)-1, szNtName);
+                szNtName[0] = 'N';
+                szNtName[1] = 't';
+
+                const SyscallKey_t key = SYSCALL_ID_RT(szNtName);
+                vecFoundSyscalls.push_back(SyscallEntry_t{ key, uSyscallNumber, 0 });
+                uSyscallNumber++;
+            }
+        }
+    }
+}
+```
+
+**How it works:**
+
+1. Access the exception directory (PDATA section)
+2. Build a map of function RVAs to export names
+3. Iterate through the runtime function entries **in order**
+4. Match each function RVA to its export name
+5. Filter for Zw* functions (user-mode syscall stubs)
+6. Assign incrementing syscall numbers based on order in exception directory
+7. Convert Zw* names to Nt* for consistency
+
+<Info>
+The exception directory on x64 Windows is ordered by syscall number, making this method highly reliable and resilient to hooks (since it doesn't read function code).
+</Info>
+
+### x86: Sorted Exports Method
+
+From `syscall.hpp:402-449`:
+
+```cpp
+else  // x86
+{
+    auto pFunctionsRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfFunctions);
+    auto pNamesRVA = reinterpret_cast<uint32_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNames);
+    auto pOrdinalsRva = reinterpret_cast<uint16_t*>(
+        module.m_pModuleBase + module.m_pExportDir->AddressOfNameOrdinals);
+
+    std::vector<std::pair<uintptr_t, const char*>> vecZwFunctions;
+    for (uint32_t i = 0; i < module.m_pExportDir->NumberOfNames; ++i)
+    {
+        const char* szName = reinterpret_cast<const char*>(
+            module.m_pModuleBase + pNamesRVA[i]);
+
+        if (szName[0] == 'Z' && szName[1] == 'w')
+        {
+            uint16_t uOrdinal = pOrdinalsRva[i];
+            uint32_t uFunctionRva = pFunctionsRVA[uOrdinal];
+
+            // Skip forwarders
+            auto pExportSectionStart = module.m_pNtHeaders->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            auto pExportSectionEnd = pExportSectionStart + 
+                module.m_pNtHeaders->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+            if (uFunctionRva >= pExportSectionStart && uFunctionRva < pExportSectionEnd)
+                continue;
+
+            uintptr_t uFunctionAddress = reinterpret_cast<uintptr_t>(
+                module.m_pModuleBase + uFunctionRva);
+            vecZwFunctions.push_back({ uFunctionAddress, szName });
+        }
+    }
+
+    if (vecZwFunctions.empty())
+        return vecFoundSyscalls;
+
+    // Sort by address
+    std::sort(vecZwFunctions.begin(), vecZwFunctions.end(),
+        [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+
+    // Assign syscall numbers in sorted order
+    uint32_t uSyscallNumber = 0;
+    for (const auto& [_, szName] : vecZwFunctions) 
+    {
+        char szNtName[128];
+        std::copy_n(szName, sizeof(szNtName)-1, szNtName);
+        szNtName[0] = 'N';
+        szNtName[1] = 't';
+
+        const SyscallKey_t key = SYSCALL_ID_RT(szNtName);
+        vecFoundSyscalls.push_back(SyscallEntry_t{ key, uSyscallNumber, 0 });
+        uSyscallNumber++;
+    }
+}
+```
+
+**How it works:**
+
+1. Enumerate all exported functions
+2. Filter for Zw* functions
+3. Skip export forwarders
+4. Collect function addresses and names
+5. **Sort by address** (syscalls are laid out in order)
+6. Assign incrementing syscall numbers based on sorted order
+7. Convert Zw* to Nt*
+
+<Info>
+On x86, syscall stubs are laid out sequentially in memory, so sorting by address produces the correct syscall numbers.
+</Info>
+
+## Advantages
+
+<CardGroup cols={2}>
+  <Card title="Hook Resilience" icon="shield">
+    Doesn't read function code, so it's immune to inline hooks that modify function prologues.
+  </Card>
+  <Card title="Fast" icon="bolt">
+    Only processes metadata structures, no signature scanning required.
+  </Card>
+  <Card title="Reliable" icon="check">
+    Based on documented PE structures and Windows syscall ordering conventions.
+  </Card>
+  <Card title="Platform-Specific" icon="code">
+    Uses the best method for each platform (exception dir on x64, sorted exports on x86).
+  </Card>
+</CardGroup>
+
+## Usage
+
+This parser is used in the `DefaultParserChain`:
+
+```cpp
+using DefaultParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,    // Primary parser
+    syscall::policies::parser::signature     // Fallback if directory fails
+>;
+```
+
+You can also use it directly:
+
+```cpp
+using DirectoryOnlyManager = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct,
+    syscall::policies::parser::directory
+>;
+
+DirectoryOnlyManager manager;
+manager.initialize();
+```
+
+## Limitations
+
+<Warning>
+This method assumes:
+- The exception directory (x64) or function layout (x86) has not been tampered with
+- ntdll.dll has not been manually mapped or relocated in unusual ways
+- Export table is intact and not obfuscated
+
+In most real-world scenarios, these assumptions hold true.
+</Warning>
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="parser::signature" href="/api/policies/parser-signature">
+    Signature-based parser with hook detection
+  </Card>
+  <Card title="ParserChain_t" href="/core-concepts/policy-composition">
+    Learn about parser fallback chains
+  </Card>
+</CardGroup>

@@ -1,0 +1,721 @@
+---
+title: "Policy Composition"
+description: "Master the art of composing allocation, generation, and parsing policies with the Manager template and ParserChain"
+---
+
+## Overview
+
+The true power of syscalls-cpp lies in its **composability**. The `Manager` template allows you to mix and match any combination of allocation, stub generation, and parsing policies to create the exact syscall strategy you need.
+
+## The Manager Template
+
+### Basic Structure
+
+Location: `syscall.hpp:631-950`
+
+```cpp
+template<
+    typename IAllocationPolicy,
+    typename IStubGenerationPolicy,
+    typename IFirstParser,
+    typename ... IFallbackParsers
+>
+class ManagerImpl { /* ... */ };
+```
+
+The Manager template accepts:
+1. **One allocation policy** - How syscall stubs are stored
+2. **One stub generation policy** - How syscall stubs are executed
+3. **One or more parsing policies** - How syscall numbers are resolved (with fallback support)
+
+### Template Specializations
+
+The library provides three template specializations for convenience:
+
+Location: `syscall.hpp:929-950`
+
+```cpp
+// Default parser chain specialization
+template<typename AllocPolicy, typename StubPolicy, typename... ParserArgs>
+class Manager : public Manager<AllocPolicy, StubPolicy, DefaultParserChain>
+{ };
+
+// ParserChain_t specialization
+template<typename AllocPolicy, typename StubPolicy, IsSyscallParsingPolicy... ParsersInChain>
+class Manager<AllocPolicy, StubPolicy, ParserChain_t<ParsersInChain...>>
+    : public ManagerImpl<AllocPolicy, StubPolicy, ParsersInChain...>
+{ };
+
+// Variadic parsers specialization
+template<typename AllocPolicy, typename StubPolicy, typename FirstParser, typename... FallbackParsers>
+class Manager<AllocPolicy, StubPolicy, FirstParser, FallbackParsers...>
+    : public ManagerImpl<AllocPolicy, StubPolicy, FirstParser, FallbackParsers...>
+{ };
+```
+
+This design allows multiple ways to specify parsers:
+
+<CodeGroup>
+```cpp Default Parser Chain
+// Uses DefaultParserChain (directory → signature)
+using Manager1 = syscall::Manager<
+    allocator::section,
+    generator::direct
+>;
+```
+
+```cpp Variadic Parsers
+// Directly specify parsers as template arguments
+using Manager2 = syscall::Manager<
+    allocator::heap,
+    generator::gadget,
+    parser::directory,
+    parser::signature
+>;
+```
+
+```cpp ParserChain_t Helper
+// Use ParserChain_t for explicit chain
+using MyChain = ParserChain_t<parser::signature, parser::directory>;
+using Manager3 = syscall::Manager<
+    allocator::memory,
+    generator::exception,
+    MyChain
+>;
+```
+</CodeGroup>
+
+## ParserChain_t
+
+The `ParserChain_t` helper is a type wrapper for parser sequences:
+
+Location: `syscall.hpp:625-629`
+
+```cpp
+template<IsSyscallParsingPolicy... IParsers>
+struct ParserChain_t
+{
+    static_assert(sizeof...(IParsers) > 0, "ParserChain_t cannot be empty.");
+};
+```
+
+### Default Parser Chain
+
+Location: `syscall.hpp:929-933`
+
+```cpp
+using DefaultParserChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory,   // Try clean PE-based parsing first
+    syscall::policies::parser::signature    // Fall back to signature scanning
+>;
+```
+
+<Info>
+**Strategy**: The default chain tries `directory` parser first (clean, no function bytes read), then falls back to `signature` parser (with hook detection and halo gates) if needed.
+</Info>
+
+### Custom Parser Chains
+
+You can create custom parser chains for specific scenarios:
+
+```cpp
+// Aggressive hook detection first
+using HookedEnvChain = syscall::ParserChain_t<
+    syscall::policies::parser::signature,   // Check for hooks first
+    syscall::policies::parser::directory    // Fall back to directory
+>;
+
+// Directory only (no fallback)
+using DirectoryOnlyChain = syscall::ParserChain_t<
+    syscall::policies::parser::directory
+>;
+
+// Signature only (no fallback)
+using SignatureOnlyChain = syscall::ParserChain_t<
+    syscall::policies::parser::signature
+>;
+```
+
+## Predefined Type Aliases
+
+The library provides convenient type aliases for common combinations:
+
+Location: `syscall.hpp:952-958`
+
+```cpp
+#if SYSCALL_PLATFORM_WINDOWS_64
+using SyscallSectionGadget = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::gadget
+>;
+
+using SyscallHeapGadget = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::gadget
+>;
+#endif
+
+using SyscallSectionDirect = syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::direct
+>;
+```
+
+### Using Predefined Aliases
+
+<CodeGroup>
+```cpp SyscallSectionDirect
+// Most secure: immutable stubs + direct syscall
+SyscallSectionDirect manager;
+if (!manager.initialize()) {
+    std::cerr << "Failed to initialize\n";
+    return 1;
+}
+
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pBaseAddress,
+    0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+```
+
+```cpp SyscallSectionGadget (x64 only)
+// Secure + indirect: immutable stubs + gadget execution
+SyscallSectionGadget manager;
+manager.initialize();
+
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    hHandle
+);
+```
+
+```cpp SyscallHeapGadget (x64 only)
+// Balanced: heap isolation + gadget execution
+SyscallHeapGadget manager;
+manager.initialize();
+
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtQuerySystemInformation"),
+    SystemBasicInformation,
+    &info,
+    sizeof(info),
+    nullptr
+);
+```
+</CodeGroup>
+
+## Creating Custom Combinations
+
+### Scenario 1: Maximum Security
+
+**Goal**: Immutable stubs that cannot be tampered with, using VEH for maximum stealth
+
+```cpp
+using MaxSecurityManager = syscall::Manager<
+    syscall::policies::allocator::section,  // Immutable with SEC_NO_CHANGE
+    syscall::policies::generator::exception, // VEH-based (no syscall in stubs)
+    syscall::DefaultParserChain             // Clean parsing with fallback
+>;
+
+MaxSecurityManager manager;
+if (!manager.initialize()) {
+    // Handle initialization failure
+}
+
+// Stubs are immutable and use exception-based syscalls
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtCreateFile"),
+    &hFile,
+    GENERIC_READ,
+    &objAttr,
+    &ioStatus,
+    nullptr,
+    FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_READ,
+    FILE_OPEN,
+    FILE_SYNCHRONOUS_IO_NONALERT,
+    nullptr,
+    0
+);
+```
+
+### Scenario 2: Performance Optimized
+
+**Goal**: Fast allocation and execution for maximum performance
+
+```cpp
+using FastManager = syscall::Manager<
+    syscall::policies::allocator::memory,   // Simple RW->RX allocation
+    syscall::policies::generator::direct,   // Direct syscall (fastest)
+    syscall::policies::parser::directory    // PE parsing only (fast)
+>;
+
+FastManager manager;
+manager.initialize();
+
+// Fast execution, minimal overhead
+for (int i = 0; i < 10000; i++) {
+    manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtQueryPerformanceCounter"),
+        &perfCounter,
+        nullptr
+    );
+}
+```
+
+### Scenario 3: Stealth Optimized
+
+**Goal**: Maximum evasion for heavily monitored environments
+
+```cpp
+using StealthManager = syscall::Manager<
+    syscall::policies::allocator::heap,     // Isolated heap
+    syscall::policies::generator::exception, // VEH-based (no syscall instruction)
+    syscall::policies::parser::signature    // Signature scanning with halo gates
+>;
+
+StealthManager manager;
+manager.initialize();
+
+// Maximum stealth: no syscall instructions, hook detection enabled
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtOpenProcess"),
+    &hProcess,
+    PROCESS_ALL_ACCESS,
+    &objAttr,
+    &clientId
+);
+```
+
+### Scenario 4: Compatibility Focused
+
+**Goal**: Works in most environments including WOW64
+
+```cpp
+using CompatibleManager = syscall::Manager<
+    syscall::policies::allocator::memory,   // Standard virtual memory
+    syscall::policies::generator::direct,   // Works on x86 and x64
+    syscall::DefaultParserChain             // Robust parsing
+>;
+
+CompatibleManager manager;
+manager.initialize();
+
+// Works on x86, x64, and WOW64
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtDelayExecution"),
+    FALSE,
+    &timeout
+);
+```
+
+## Manager Initialization
+
+The `initialize()` method sets up the syscall infrastructure:
+
+Location: `syscall.hpp:714-770`
+
+```cpp
+[[nodiscard]] bool initialize(const std::vector<SyscallKey_t>& vecModuleKeys = { SYSCALL_ID("ntdll.dll") })
+{
+    if (m_bInitialized)
+        return true;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_bInitialized)
+        return true;
+        
+#if SYSCALL_PLATFORM_WINDOWS_64
+    // Find syscall gadgets if required by generator policy
+    if constexpr (IStubGenerationPolicy::bRequiresGadget)
+        if (!findSyscallGadgets())
+            return false;
+#endif
+
+    // Parse syscalls from all specified modules
+    m_vecParsedSyscalls.clear();
+    for (const auto& moduleKey : vecModuleKeys)
+    {
+        ModuleInfo_t moduleInfo;
+        if (!getModuleInfo(moduleKey, moduleInfo))
+            continue;
+
+        std::vector<SyscallEntry_t> moduleSyscalls = tryParseSyscalls<IFirstParser, IFallbackParsers...>(moduleInfo);
+        m_vecParsedSyscalls.insert(m_vecParsedSyscalls.end(), moduleSyscalls.begin(), moduleSyscalls.end());
+    }
+
+    if (m_vecParsedSyscalls.empty())
+        return false;
+
+    // Randomize syscall order for OPSEC
+    if (m_vecParsedSyscalls.size() > 1)
+        for (size_t i = m_vecParsedSyscalls.size() - 1; i > 0; --i)
+            std::swap(m_vecParsedSyscalls[i], m_vecParsedSyscalls[native::rdtscp() % (i + 1)]);
+
+    // Assign offsets
+    for (size_t i = 0; i < m_vecParsedSyscalls.size(); ++i)
+        m_vecParsedSyscalls[i].m_uOffset = static_cast<uint32_t>(i * IStubGenerationPolicy::getStubSize());
+
+    // Sort by key for binary search
+    std::ranges::sort(m_vecParsedSyscalls, std::less{}, &SyscallEntry_t::m_key);
+
+    // Create syscall stubs
+    m_bInitialized = createSyscalls();
+    
+    // Register VEH if using exception generator
+    if (m_bInitialized)
+    {
+        if constexpr (std::is_same_v<IStubGenerationPolicy, policies::generator::exception>)
+        {
+            m_pVehHandle = AddVectoredExceptionHandler(1, VectoredExceptionHandler);
+            if (!m_pVehHandle)
+            {
+                IAllocationPolicy::release(m_pSyscallRegion, m_hObjectHandle);
+                m_pSyscallRegion = nullptr;
+                m_bInitialized = false;
+            }
+        }
+    }
+
+    return m_bInitialized;
+}
+```
+
+### Initialization Steps
+
+<Steps>
+  <Step title="Thread Safety">
+    Double-checked locking ensures thread-safe initialization
+  </Step>
+  
+  <Step title="Gadget Discovery">
+    If the generator policy requires gadgets, scan ntdll for `syscall; ret` sequences
+  </Step>
+  
+  <Step title="Parse Modules">
+    Parse syscall numbers from specified modules (default: ntdll.dll) using the parser chain
+  </Step>
+  
+  <Step title="Randomization">
+    Shuffle syscall entries for OPSEC (makes analysis harder)
+  </Step>
+  
+  <Step title="Assign Offsets">
+    Calculate memory offsets for each stub based on stub size
+  </Step>
+  
+  <Step title="Sort for Search">
+    Sort entries by key to enable binary search in `invoke()`
+  </Step>
+  
+  <Step title="Generate Stubs">
+    Create all syscall stubs and allocate memory using the allocation policy
+  </Step>
+  
+  <Step title="Register VEH">
+    If using exception generator, register the vectored exception handler
+  </Step>
+</Steps>
+
+### Multi-Module Parsing
+
+You can parse syscalls from multiple modules:
+
+```cpp
+SyscallSectionDirect manager;
+
+// Parse both ntdll.dll and win32u.dll
+if (!manager.initialize({ 
+    SYSCALL_ID("ntdll.dll"),
+    SYSCALL_ID("win32u.dll")
+})) {
+    std::cerr << "Initialization failed\n";
+    return 1;
+}
+
+// Can now invoke syscalls from both modules
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtUserGetDC"),  // from win32u.dll
+    hWnd
+);
+```
+
+## Invoking Syscalls
+
+The `invoke()` method provides type-safe syscall execution:
+
+Location: `syscall.hpp:771-820`
+
+```cpp
+template<typename Ret = uintptr_t, typename... Args>
+[[nodiscard]] SYSCALL_FORCE_INLINE Ret invoke(const SyscallKey_t& syscallId, Args... args)
+{
+    // Lazy initialization
+    if (!m_bInitialized)
+    {
+        if (!initialize())
+        {
+            if constexpr (std::is_same_v<Ret, NTSTATUS>)
+                return native::STATUS_UNSUCCESSFUL;
+            return Ret{};
+        }
+    }
+    
+    // Binary search for syscall entry
+    auto it = std::ranges::lower_bound(m_vecParsedSyscalls, syscallId, std::less{}, &SyscallEntry_t::m_key);
+
+    if (it == m_vecParsedSyscalls.end() || it->m_key != syscallId)
+    {
+        if constexpr (std::is_same_v<Ret, NTSTATUS>)
+            return native::STATUS_PROCEDURE_NOT_FOUND;
+        return Ret{};
+    }
+
+    // Calculate stub address
+    uint8_t* pStubAddress = reinterpret_cast<uint8_t*>(m_pSyscallRegion) + it->m_uOffset;
+    
+    // Exception generator requires special handling
+    if constexpr (std::is_same_v<IStubGenerationPolicy, policies::generator::exception>)
+    {
+        // ... exception context setup ...
+        CExceptionContextGuard contextGuard(pStubAddress, pRandomGadget, it->m_uSyscallNumber);
+        return reinterpret_cast<Function_t>(pStubAddress)(std::forward<Args>(args)...);
+    }
+
+    // Direct or gadget generator
+    return reinterpret_cast<Function_t>(pStubAddress)(std::forward<Args>(args)...);
+}
+```
+
+### Type Safety
+
+```cpp
+SyscallSectionDirect manager;
+manager.initialize();
+
+// Specify return type explicitly
+NTSTATUS status = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    NtCurrentProcess(),
+    &pBaseAddress,
+    0, &uSize,
+    MEM_COMMIT | MEM_RESERVE,
+    PAGE_READWRITE
+);
+
+// Or use auto
+auto status2 = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtFreeVirtualMemory"),
+    NtCurrentProcess(),
+    &pBaseAddress,
+    &uSize,
+    MEM_RELEASE
+);
+```
+
+## Comparison Matrix
+
+| Combination | Security | Performance | Stealth | Platform |
+|-------------|----------|-------------|---------|----------|
+| `section` + `direct` | High | Fast | Low | x86 + x64 |
+| `section` + `gadget` | High | Fast | Medium | x64 only |
+| `section` + `exception` | Very High | Slower | High | x86 + x64 |
+| `heap` + `direct` | Medium | Fast | Low | x86 + x64 |
+| `heap` + `gadget` | Medium | Fast | Medium | x64 only |
+| `heap` + `exception` | Medium | Slower | High | x86 + x64 |
+| `memory` + `direct` | Low | Fastest | Low | x86 + x64 |
+| `memory` + `gadget` | Low | Fast | Medium | x64 only |
+| `memory` + `exception` | Low | Slower | High | x86 + x64 |
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Choose Policies Based on Threat Model">
+    - **High security environment**: Use `section` + `exception`
+    - **Moderate security**: Use `heap` + `gadget` or `section` + `direct`
+    - **Performance critical**: Use `memory` + `direct`
+    - **Maximum stealth**: Use `section` + `exception` with signature parser
+  </Accordion>
+
+  <Accordion title="Use Type Aliases for Common Patterns">
+    Instead of redefining the same combination multiple times:
+    
+    ```cpp
+    // Define once
+    using MyManager = syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::direct
+    >;
+    
+    // Reuse everywhere
+    MyManager manager1;
+    MyManager manager2;
+    ```
+  </Accordion>
+
+  <Accordion title="Initialize Early">
+    Initialization involves parsing PE structures and allocating memory. Do it once during setup:
+    
+    ```cpp
+    SyscallSectionDirect manager;
+    
+    // Initialize during application startup
+    if (!manager.initialize()) {
+        std::cerr << "Failed to initialize syscalls\n";
+        return 1;
+    }
+    
+    // Use throughout application lifetime
+    // ...
+    ```
+  </Accordion>
+
+  <Accordion title="Use Parser Chains for Robustness">
+    Always use a parser chain (or default) to handle edge cases:
+    
+    ```cpp
+    // Good: Has fallback
+    using RobustManager = syscall::Manager<
+        allocator::section,
+        generator::direct,
+        DefaultParserChain  // directory → signature
+    >;
+    
+    // Less robust: No fallback
+    using FragileManager = syscall::Manager<
+        allocator::section,
+        generator::direct,
+        parser::directory   // Only one parser
+    >;
+    ```
+  </Accordion>
+
+  <Accordion title="Use nullptr Instead of NULL on x64">
+    On x64, `NULL` is often defined as integer `0` (32-bit), which can corrupt the stack:
+    
+    ```cpp
+    // WRONG on x64
+    manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        NtCurrentProcess(),
+        &pBase,
+        NULL,  // Danger! May be 32-bit
+        &size,
+        MEM_COMMIT,
+        PAGE_READWRITE
+    );
+    
+    // CORRECT
+    manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        NtCurrentProcess(),
+        &pBase,
+        nullptr,  // Safe: proper 64-bit pointer
+        &size,
+        MEM_COMMIT,
+        PAGE_READWRITE
+    );
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Complete Example
+
+```cpp
+#include <iostream>
+#include "syscall.hpp"
+
+int main()
+{
+    // Define custom manager for maximum security
+    using SecureManager = syscall::Manager<
+        syscall::policies::allocator::section,   // Immutable stubs
+        syscall::policies::generator::exception,  // VEH-based
+        syscall::DefaultParserChain               // Robust parsing
+    >;
+
+    SecureManager manager;
+
+    // Initialize with ntdll
+    if (!manager.initialize({ SYSCALL_ID("ntdll.dll") }))
+    {
+        std::cerr << "Failed to initialize syscall manager\n";
+        return 1;
+    }
+
+    std::cout << "Syscall manager initialized successfully\n";
+
+    // Allocate memory via syscall
+    PVOID pBaseAddress = nullptr;
+    SIZE_T uSize = 0x1000;
+
+    NTSTATUS status = manager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        NtCurrentProcess(),
+        &pBaseAddress,
+        nullptr,
+        &uSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+
+    if (NT_SUCCESS(status))
+    {
+        std::cout << "Memory allocated at: 0x" << std::hex << pBaseAddress << std::dec << std::endl;
+
+        // Write some data
+        std::memcpy(pBaseAddress, "Hello from syscalls!", 20);
+        std::cout << "Data: " << static_cast<char*>(pBaseAddress) << std::endl;
+
+        // Free memory
+        uSize = 0;
+        status = manager.invoke<NTSTATUS>(
+            SYSCALL_ID("NtFreeVirtualMemory"),
+            NtCurrentProcess(),
+            &pBaseAddress,
+            &uSize,
+            MEM_RELEASE
+        );
+
+        if (NT_SUCCESS(status))
+            std::cout << "Memory freed successfully\n";
+    }
+    else
+    {
+        std::cerr << "Failed to allocate memory: 0x" << std::hex << status << std::dec << std::endl;
+    }
+
+    return 0;
+}
+```
+
+## Summary
+
+Policy composition in syscalls-cpp provides:
+
+<CardGroup cols={2}>
+  <Card title="Flexibility" icon="arrows-split-up-and-left">
+    Mix and match policies to create custom strategies
+  </Card>
+  
+  <Card title="Type Safety" icon="shield-check">
+    C++20 concepts enforce policy contracts at compile-time
+  </Card>
+  
+  <Card title="Extensibility" icon="puzzle-piece">
+    Write custom policies that integrate seamlessly
+  </Card>
+  
+  <Card title="Performance" icon="gauge-high">
+    Zero-cost abstractions with compile-time policy selection
+  </Card>
+</CardGroup>
+
+<Info>
+**Next**: Explore the [API Reference](/api-reference) to learn about all available methods and types.
+</Info>

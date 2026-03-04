@@ -1,80 +1,272 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Build your first syscall manager in minutes
 ---
 
-## Get started in three steps
+This guide will walk you through creating your first program using syscalls-cpp. You'll learn how to initialize a syscall manager and invoke system calls directly.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Ensure you have completed the [installation](/installation) steps and have a C++20-compatible compiler configured.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+## Basic Usage
+
+<Steps>
+  <Step title="Include the header">
+    Start by including the syscalls-cpp header in your source file:
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    ```cpp
+    #include <iostream>
+    #include <syscalls-cpp/syscall.hpp>
+    ```
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    This single header provides access to all syscall management functionality.
+  </Step>
+  
+  <Step title="Create a syscall manager">
+    Instantiate a `syscall::Manager` with your chosen policies:
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```cpp
+    int main() {
+        // Create a manager with section-based allocation and direct syscalls
+        syscall::Manager<
+            syscall::policies::allocator::section,
+            syscall::policies::generator::direct
+        > syscallManager;
+    ```
+    
+    <Tip>
+      The `Manager` template takes two required parameters:
+      1. **Allocation Policy**: How memory for stubs is allocated
+      2. **Stub Generation Policy**: How syscall instructions are generated
+      
+      An optional third parameter specifies parsing policies (defaults to `directory` with `signature` fallback).
+    </Tip>
+  </Step>
+  
+  <Step title="Initialize the manager">
+    Before invoking syscalls, initialize the manager to parse system call numbers:
+    
+    ```cpp
+        if (!syscallManager.initialize()) {
+            std::cerr << "initialization failed!\n";
+            return 1;
+        }
+    ```
+    
+    By default, `initialize()` parses `ntdll.dll`. You can parse additional modules:
+    
+    ```cpp
+    // Parse multiple modules
+    syscallManager.initialize({
+        SYSCALL_ID("ntdll.dll"),
+        SYSCALL_ID("win32u.dll")
+    });
+    ```
+  </Step>
+  
+  <Step title="Invoke a syscall">
+    Use the `invoke()` method to call a system call by name:
+    
+    ```cpp
+        PVOID pBaseAddress = nullptr;
+        SIZE_T uSize = 0x1000;
+        
+        std::ignore = syscallManager.invoke<NTSTATUS>(
+            SYSCALL_ID("NtAllocateVirtualMemory"),
+            syscall::native::getCurrentProcess(),
+            &pBaseAddress,
+            0, &uSize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+    ```
+    
+    <Info>
+      - The first template parameter (`NTSTATUS`) specifies the return type
+      - `SYSCALL_ID()` computes a compile-time hash of the syscall name
+      - Arguments match the native Windows API signature
+    </Info>
+  </Step>
+  
+  <Step title="Verify the result">
+    Check that the syscall succeeded:
+    
+    ```cpp
+        if (pBaseAddress) {
+            std::cout << "allocation successful at 0x" << pBaseAddress << std::endl;
+        }
+        
+        return 0;
+    }
+    ```
+  </Step>
+</Steps>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+## Complete Example
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+Here's the full working example:
 
-### Step 3: Go live
+```cpp basic-usage.cpp
+#include <iostream>
+#include <syscalls-cpp/syscall.hpp>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+int main() 
+{
+    syscall::Manager<
+        syscall::policies::allocator::section,
+        syscall::policies::generator::direct
+    > syscallManager;
+    
+    if (!syscallManager.initialize())
+    {
+        std::cerr << "initialization failed!\n";
+        return 1;
+    }
 
-## Next steps
+    PVOID pBaseAddress = nullptr;
+    SIZE_T uSize = 0x1000;
 
-Now that you have your docs running, explore these key features:
+    std::ignore = syscallManager.invoke<NTSTATUS>(
+        SYSCALL_ID("NtAllocateVirtualMemory"),
+        syscall::native::getCurrentProcess(),
+        &pBaseAddress,
+        0, &uSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+
+    if (pBaseAddress)
+        std::cout << "allocation successful at 0x" << pBaseAddress << std::endl;
+
+    return 0;
+}
+```
+
+## Key Concepts
+
+### Type Aliases
+
+For convenience, syscalls-cpp provides pre-configured type aliases:
+
+<CodeGroup>
+```cpp x64 Only
+// Section + Gadget (x64 only)
+SyscallSectionGadget manager;
+
+// Heap + Gadget (x64 only)
+SyscallHeapGadget manager;
+```
+
+```cpp Cross-platform
+// Section + Direct (x86/x64)
+SyscallSectionDirect manager;
+```
+</CodeGroup>
+
+### The SYSCALL_ID Macro
+
+The `SYSCALL_ID()` macro performs compile-time hashing of function names for efficient lookups:
+
+```cpp
+// Compile-time hash
+auto result = manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtAllocateVirtualMemory"),
+    // ...
+);
+```
+
+For runtime strings, use `SYSCALL_ID_RT()`:
+
+```cpp
+const char* dynamicName = getSyscallName();
+auto result = manager.invoke<NTSTATUS>(
+    SYSCALL_ID_RT(dynamicName),
+    // ...
+);
+```
+
+### NULL vs nullptr on x64
+
+<Warning>
+  **Always use `nullptr` instead of `NULL`** when invoking syscalls on x64.
+  
+  The `NULL` macro is often defined as `0` (a 32-bit `int`). Passing it to a syscall expecting a 64-bit pointer can corrupt the stack, causing argument misalignment and crashes.
+  
+  `nullptr` is type-safe and guarantees the correct 64-bit null pointer representation.
+</Warning>
+
+```cpp
+// ❌ Bad - may crash on x64
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    NULL  // Dangerous!
+);
+
+// ✅ Good - type-safe
+manager.invoke<NTSTATUS>(
+    SYSCALL_ID("NtClose"),
+    nullptr  // Safe
+);
+```
+
+## Advanced Configuration
+
+### Custom Policy Combinations
+
+You can mix and match policies based on your security requirements:
+
+```cpp
+// Maximum stealth: section allocation + gadget-based syscalls
+syscall::Manager<
+    syscall::policies::allocator::section,
+    syscall::policies::generator::gadget
+> stealthManager;
+
+// Exception-based: triggers via VEH
+syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::exception
+> exceptionManager;
+
+// Memory-based: standard allocation
+syscall::Manager<
+    syscall::policies::allocator::memory,
+    syscall::policies::generator::direct
+> standardManager;
+```
+
+### Custom Type Aliases
+
+Create your own type aliases for commonly used configurations:
+
+```cpp
+// Define once
+using MySyscallManager = syscall::Manager<
+    syscall::policies::allocator::heap,
+    syscall::policies::generator::direct
+>;
+
+// Use anywhere
+MySyscallManager manager;
+manager.initialize();
+```
+
+## Next Steps
+
+Now that you understand the basics, explore more advanced topics:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Core Concepts" icon="book" href="/core-concepts/overview">
+    Deep dive into policies and architecture
+  </Card>
+  <Card title="Custom Policies" icon="puzzle-piece" href="/guides/custom-policies">
+    Learn to create your own allocation and generation policies
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/manager">
+    Complete API documentation
+  </Card>
+  <Card title="Examples" icon="flask" href="/examples/direct-syscalls">
+    More real-world usage examples
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
