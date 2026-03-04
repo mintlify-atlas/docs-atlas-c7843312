@@ -1,0 +1,122 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "syscalls-cpp",
+  "projectDescription": "A modern C++20 header-only library for advanced direct system call invocation with policy-based design.",
+  "theme": "aspen",
+  "primaryColor": "#242b2c",
+  "lightColor": "#040404",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "installation", "quickstart"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "core-concepts/overview",
+              "core-concepts/allocation-policies",
+              "core-concepts/stub-generation-policies",
+              "core-concepts/parsing-policies",
+              "core-concepts/policy-composition"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/basic-usage",
+              "guides/custom-policies",
+              "guides/debugging",
+              "guides/security-considerations"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/direct-syscalls",
+              "examples/gadget-syscalls",
+              "examples/exception-syscalls",
+              "examples/custom-generators"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Manager",
+            "pages": [
+              "api/manager",
+              "api/manager-initialization",
+              "api/manager-invocation"
+            ]
+          },
+          {
+            "group": "Allocation Policies",
+            "pages": [
+              "api/policies/allocator-section",
+              "api/policies/allocator-heap",
+              "api/policies/allocator-memory"
+            ]
+          },
+          {
+            "group": "Stub Generation Policies",
+            "pages": [
+              "api/policies/generator-direct",
+              "api/policies/generator-gadget",
+              "api/policies/generator-exception"
+            ]
+          },
+          {
+            "group": "Parsing Policies",
+            "pages": [
+              "api/policies/parser-directory",
+              "api/policies/parser-signature"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/utilities/hashing",
+              "api/utilities/native-api",
+              "api/utilities/type-aliases"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Policy-based design for flexible syscall strategies",
+    "Automatic syscall number resolution from ntdll.dll",
+    "Multiple allocation methods (section with SEC_NO_CHANGE, heap, virtual memory)",
+    "Three stub generation approaches (direct, gadget, exception-based)",
+    "Hook detection and evasion via neighboring syscall resolution",
+    "Compile-time string hashing for operational security",
+    "Header-only C++20 library with zero runtime dependencies",
+    "Support for both x86 and x64 Windows platforms"
+  ],
+  "publicApiSurface": [
+    "syscall::Manager<AllocPolicy, StubPolicy, ParserChain>",
+    "syscall::policies::allocator::section",
+    "syscall::policies::allocator::heap",
+    "syscall::policies::allocator::memory",
+    "syscall::policies::generator::direct",
+    "syscall::policies::generator::gadget",
+    "syscall::policies::generator::exception",
+    "syscall::policies::parser::directory",
+    "syscall::policies::parser::signature",
+    "syscall::ParserChain_t<Parsers...>",
+    "SyscallSectionDirect",
+    "SyscallSectionGadget",
+    "SyscallHeapGadget",
+    "SYSCALL_ID(name)",
+    "Manager::initialize()",
+    "Manager::invoke<ReturnType>(syscallId, args...)"
+  ]
+}
